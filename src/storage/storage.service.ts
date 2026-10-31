@@ -42,21 +42,27 @@ export abstract class StorageService {
    */
   abstract createUploadUrl(key: string, contentType: string, expiresInSeconds?: number): Promise<string>;
 
-  /** Content-addressed layout: cheap to shard, and collisions are impossible. */
+  /**
+   * Content-addressed layout, scoped to the tenant.
+   *
+   * The key is derived from the content hash alone, so identical bytes always
+   * resolve to the same object no matter which tender or document slot they
+   * were uploaded for. That is what lets one certificate submitted to twelve
+   * tenders be stored once and referenced by twelve version rows.
+   *
+   * Tender and document ids are deliberately NOT in the path: including them
+   * would make the key content-plus-context addressed, which stores the same
+   * bytes once per slot and defeats the de-duplication the checksum exists for.
+   * The database holds the mapping from object to slots.
+   *
+   * The two-character shard keeps any single prefix from becoming hot.
+   */
   static buildObjectKey(params: {
     organizationId: string;
-    tenderId: string;
-    documentId: string;
     checksum: string;
     extension: string;
   }): string {
     const shard = params.checksum.slice(0, 2);
-    return [
-      'org', params.organizationId,
-      'tender', params.tenderId,
-      'doc', params.documentId,
-      shard,
-      `${params.checksum}${params.extension}`,
-    ].join('/');
+    return ['org', params.organizationId, shard, `${params.checksum}${params.extension}`].join('/');
   }
 }

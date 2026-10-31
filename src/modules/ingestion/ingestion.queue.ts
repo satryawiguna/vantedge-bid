@@ -19,17 +19,14 @@ export class IngestionQueueService {
   }
 
   /**
-   * Enqueue one document for processing.
+   * Publish one document for processing.
    *
-   * The job id is the content checksum, which makes the enqueue idempotent at
-   * the broker: a retried request, a duplicated storage event or a double-click
-   * all resolve to the same job, and BullMQ silently ignores the second add.
-   * Without this, at-least-once delivery upstream becomes duplicated work here.
+   * The caller supplies the job id (see `ingestionJobId`) because it must
+   * already have been written to `ingestion_jobs` and committed before this
+   * runs. Publishing first would let a worker start against state that has not
+   * been recorded yet.
    */
-  async enqueue(payload: IngestionJobPayload, priority: number): Promise<string> {
-    // BullMQ reserves ':' in custom ids — it is the Redis key separator.
-    const jobId = `ingest-${payload.checksum}`;
-
+  async enqueue(payload: IngestionJobPayload, priority: number, jobId: string): Promise<string> {
     try {
       await this.queue.add('ingest-document', payload, {
         jobId,

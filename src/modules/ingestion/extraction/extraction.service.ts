@@ -58,28 +58,35 @@ export class ExtractionService {
     // Re-extraction replaces the previous row rather than accumulating rows:
     // one extraction per version is a constraint in the schema, not a
     // convention here.
-    await this.extractions.delete({ versionId });
-    await this.extractions.insert({
-      versionId,
-      textStorageKey,
-      documentNumber: fields.documentNumber,
-      issuer: fields.issuer,
-      holderName: fields.holderName,
-      holderNpwp: fields.holderNpwp,
-      issuedAt: fields.issuedAt,
-      expiresAt: fields.expiresAt,
-      classificationCodes: fields.classificationCodes,
-      monetaryValue: fields.monetaryValue,
-      // Same TypeORM limitation as in ComplianceService: QueryDeepPartialEntity
-      // has no deep-partial form for a jsonb column typed Record<string, unknown>.
-      // Cast localised here rather than weakening the entity to `any`.
-      extractedData: fields.extras as QueryDeepPartialEntity<Record<string, unknown>>,
-      confidence: fields.confidence,
-      extractorVersion: EXTRACTOR_VERSION,
-      // Diagnostics about the run, kept apart from document content so a
-      // query over extracted_data never has to step around them.
-      raw: { textLength: text.length, streamsDecoded, streamsTotal },
-    });
+    //
+    // Upsert rather than delete-then-insert. The two-statement version left a
+    // window in which a processed version had no extraction at all, and two
+    // workers handling the same version could both delete and then collide on
+    // UNIQUE (version_id).
+    await this.extractions.upsert(
+      {
+        versionId,
+        textStorageKey,
+        documentNumber: fields.documentNumber,
+        issuer: fields.issuer,
+        holderName: fields.holderName,
+        holderNpwp: fields.holderNpwp,
+        issuedAt: fields.issuedAt,
+        expiresAt: fields.expiresAt,
+        classificationCodes: fields.classificationCodes,
+        monetaryValue: fields.monetaryValue,
+        // Same TypeORM limitation as in ComplianceService: QueryDeepPartialEntity
+        // has no deep-partial form for a jsonb column typed Record<string, unknown>.
+        // Cast localised here rather than weakening the entity to `any`.
+        extractedData: fields.extras as QueryDeepPartialEntity<Record<string, unknown>>,
+        confidence: fields.confidence,
+        extractorVersion: EXTRACTOR_VERSION,
+        // Diagnostics about the run, kept apart from document content so a
+        // query over extracted_data never has to step around them.
+        raw: { textLength: text.length, streamsDecoded, streamsTotal },
+      },
+      { conflictPaths: ['versionId'] },
+    );
 
     this.logger.debug(
       { versionId, textLength: text.length, confidence: fields.confidence },

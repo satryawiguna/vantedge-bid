@@ -40,7 +40,11 @@ CREATE TYPE document_lifecycle AS ENUM (
     'processing',   -- a worker holds it
     'processed',    -- text + metadata extracted, ready for audit
     'failed',       -- processing failed after all retries
-    'quarantined'   -- rejected by a safety check (corrupt, encrypted, infected)
+    -- Terminal, and distinct from 'failed': the file was read and judged
+    -- unusable (no text layer, corrupt, encrypted), so retrying cannot help.
+    -- NOTE: there is no malware scanning in this service. If one is added, its
+    -- rejections belong in this state too.
+    'quarantined'
 );
 
 CREATE TYPE ingestion_job_state AS ENUM (
@@ -205,17 +209,31 @@ CREATE TABLE document_versions (
     metadata         jsonb       NOT NULL DEFAULT '{}'::jsonb,
 
     CONSTRAINT document_versions_version_key   UNIQUE (document_id, version_no),
-    CONSTRAINT document_versions_storage_key   UNIQUE (storage_bucket, storage_key),
+    -- Deliberately NOT unique. Storage is content-addressed, so every version
+    -- holding identical bytes points at the same object. One certificate
+    -- submitted to twelve tenders is one object and twelve version rows.
     CONSTRAINT document_versions_version_check CHECK (version_no >= 1),
     CONSTRAINT document_versions_size_check    CHECK (size_bytes > 0),
     CONSTRAINT document_versions_checksum_check CHECK (checksum_sha256 ~ '^[0-9a-f]{64}$')
 );
 
--- Content-addressed de-duplication per tenant: re-uploading the same bytes is
--- cheap to detect and lets the ingestion endpoint stay idempotent.
-CREATE UNIQUE INDEX document_versions_org_checksum_key
+-- De-duplication is scoped to the document slot, not the tenant.
+--
+-- A contractor submits the same SBU, NIB and NPWP to every tender they bid for;
+-- that is the normal case. A tenant-wide unique index treats the second tender's
+-- upload as a duplicate and discards it, leaving that tender's slot empty while
+-- the API reports success. Uniqueness therefore belongs on (document_id,
+-- checksum): the same bytes twice in one slot is a retry, the same bytes in a
+-- different slot is a different document.
+CREATE UNIQUE INDEX document_versions_slot_checksum_key
+    ON document_versions (document_id, checksum_sha256);
+
+-- Non-unique: supports "is this content already stored for this tenant?", which
+-- is what lets a repeat upload skip the object write.
+CREATE INDEX document_versions_org_checksum_idx
     ON document_versions (organization_id, checksum_sha256);
 
+CREATE INDEX document_versions_storage_key_idx  ON document_versions (storage_bucket, storage_key);
 CREATE INDEX document_versions_document_idx  ON document_versions (document_id, version_no DESC);
 CREATE INDEX document_versions_lifecycle_idx ON document_versions (lifecycle, uploaded_at)
     WHERE lifecycle IN ('pending', 'queued', 'processing');
@@ -317,9 +335,18 @@ CREATE INDEX idempotency_keys_expiry_idx ON idempotency_keys (expires_at);
 -- Module 2 — Compliance Audit
 -- -----------------------------------------------------------------------------
 
--- A ruleset is an immutable, versioned snapshot of the regulation in force.
--- Audits reference the ruleset they ran under, so a past verdict can always be
--- explained even after the rules change.
+-- A versioned snapshot of the regulation in force. Audits reference the ruleset
+-- they ran under, so a past verdict can always be explained after rules change.
+--
+-- Rulesets are GLOBAL, not per-tenant: every organisation is audited against the
+-- same published regulation. Per-tenant rule overrides would need an
+-- organization_id here and in compliance_rules; that is a product decision, not
+-- an oversight.
+--
+-- Treated as immutable by convention only. Nothing in this schema prevents an
+-- UPDATE to a ruleset an audit has already cited, which would silently rewrite
+-- that audit's meaning. Enforcing it needs a trigger; see the README's
+-- limitations section.
 CREATE TABLE compliance_rulesets (
     id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     code           text        NOT NULL,   -- e.g. 'LKPP_KONSTRUKSI'

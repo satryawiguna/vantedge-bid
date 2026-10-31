@@ -92,14 +92,18 @@ erDiagram
         uuid        id PK
         uuid        version_id FK   "one per version"
         text        document_number
+        text        issuer
         text        holder_name
         text        holder_npwp
         date        issued_at
         date        expires_at
         text_array  classification_codes
         numeric     monetary_value
+        jsonb       extracted_data  "document-type-specific fields"
         numeric     confidence
         text        extractor_version
+        jsonb       raw             "extraction run diagnostics"
+        text        text_storage_key "full text lives in object storage"
     }
     INGESTION_JOBS {
         uuid        id PK
@@ -130,9 +134,23 @@ is the **file**. Separating them buys four things at once:
    without a correlated subquery or a window function.
 3. A tender can legitimately need several documents of the same type — one SKK
    per key person — so no unique constraint on `(tender_id, document_type_code)`.
-4. `checksum_sha256` is unique per organization, so re-uploading identical bytes
-   is detected in the database rather than by convention. This is what makes the
-   ingestion endpoint safely retryable.
+4. `checksum_sha256` is unique per **document slot** — `(document_id,
+   checksum_sha256)` — so a repeat upload into the same slot is detected by the
+   database rather than by convention, and the ingestion endpoint is safely
+   retryable.
+
+   The scope matters and was originally wrong. A tenant-wide unique index looks
+   equivalent and is not: a contractor submits the same SBU, NIB and NPWP to
+   every tender they bid for, so the second tender's upload was treated as a
+   duplicate, answered `202`, and discarded — leaving that tender's slot empty
+   while the audit reported the document as never uploaded. The same bytes in a
+   *different* slot are a different document and get their own version row.
+
+   Storage de-duplication is a separate concern and is preserved: object keys
+   are content-addressed per tenant (`org/<id>/<shard>/<checksum>`), so one
+   certificate across twelve tenders is one object and twelve version rows. The
+   non-unique `(organization_id, checksum_sha256)` index is what answers "are
+   these bytes already stored?" and lets the repeat upload skip the write.
 
 `document_extractions` is a separate table rather than columns on
 `document_versions` because extraction is re-runnable: a better parser version
@@ -246,7 +264,15 @@ not defend its own history. So:
 - A partial unique index allows exactly one active version per ruleset code.
 
 Re-running an old audit reproduces the old verdict. That property is the whole
-point of the module.
+point of the module — **and it is currently enforced by convention, not by the
+database.** Nothing stops an `UPDATE` to a ruleset an audit has already cited.
+A trigger rejecting changes to a referenced ruleset is the missing piece; see
+the README's known-gaps section.
+
+Rulesets are also **global, not per-tenant**: every organisation is audited
+against the same published regulation, which is why `compliance_rulesets` and
+`compliance_rules` carry no `organization_id`. Per-tenant overrides would need
+one on both tables. That is a product decision, not an oversight.
 
 ### `is_active` and the effective window are different questions
 

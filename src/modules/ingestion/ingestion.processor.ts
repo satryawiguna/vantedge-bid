@@ -42,8 +42,12 @@ export class IngestionProcessor extends WorkerHost {
   async process(job: Job<IngestionJobPayload>): Promise<{ textLength: number; confidence: number }> {
     const startedAt = Date.now();
     const payload = job.data;
+    // Key job bookkeeping on the job id, not the version. The schema allows
+    // several job rows per version (uniqueness is on queue_name + job_key), so
+    // keying on versionId would update every attempt ever recorded for it.
+    const jobKey = job.id!;
 
-    await this.markJobState(payload.versionId, {
+    await this.markJobState(jobKey, {
       state: IngestionJobState.Active,
       attempt: job.attemptsMade + 1,
       startedAt: new Date(),
@@ -69,7 +73,7 @@ export class IngestionProcessor extends WorkerHost {
         throw new UnrecoverableError('Document yielded no extractable text');
       }
 
-      await this.finishSuccessfully(payload, startedAt);
+      await this.finishSuccessfully(payload, jobKey, startedAt);
 
       // The audit runs after every ingestion so the tender's compliance state
       // is never stale with respect to its documents.
@@ -81,7 +85,7 @@ export class IngestionProcessor extends WorkerHost {
 
       return { textLength: result.textLength, confidence: result.confidence };
     } catch (error) {
-      await this.recordFailure(payload, job, error, startedAt);
+      await this.recordFailure(payload, jobKey, job, error, startedAt);
       throw error;
     }
   }
@@ -97,7 +101,11 @@ export class IngestionProcessor extends WorkerHost {
 
   // ---------------------------------------------------------------------------
 
-  private async finishSuccessfully(payload: IngestionJobPayload, startedAt: number): Promise<void> {
+  private async finishSuccessfully(
+    payload: IngestionJobPayload,
+    jobKey: string,
+    startedAt: number,
+  ): Promise<void> {
     const finishedAt = new Date();
 
     await this.dataSource.transaction(async (manager) => {
@@ -107,7 +115,7 @@ export class IngestionProcessor extends WorkerHost {
       );
 
       await manager.getRepository(IngestionJob).update(
-        { versionId: payload.versionId },
+        { jobKey },
         {
           state: IngestionJobState.Completed,
           finishedAt,
@@ -130,6 +138,7 @@ export class IngestionProcessor extends WorkerHost {
 
   private async recordFailure(
     payload: IngestionJobPayload,
+    jobKey: string,
     job: Job<IngestionJobPayload>,
     error: unknown,
     startedAt: number,
@@ -138,7 +147,7 @@ export class IngestionProcessor extends WorkerHost {
     const message = error instanceof Error ? error.message : String(error);
 
     await this.dataSource.getRepository(IngestionJob).update(
-      { versionId: payload.versionId },
+      { jobKey },
       {
         state: exhausted ? IngestionJobState.DeadLetter : IngestionJobState.Failed,
         attempt: job.attemptsMade + 1,
@@ -174,10 +183,7 @@ export class IngestionProcessor extends WorkerHost {
     await this.dataSource.getRepository(DocumentVersion).update({ id: versionId }, { lifecycle });
   }
 
-  private async markJobState(
-    versionId: string,
-    patch: Partial<IngestionJob>,
-  ): Promise<void> {
-    await this.dataSource.getRepository(IngestionJob).update({ versionId }, patch);
+  private async markJobState(jobKey: string, patch: Partial<IngestionJob>): Promise<void> {
+    await this.dataSource.getRepository(IngestionJob).update({ jobKey }, patch);
   }
 }

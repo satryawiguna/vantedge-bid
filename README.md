@@ -40,7 +40,7 @@ the design can be judged — not implemented, and not claimed to be.
 | Rule-based compliance engine over a versioned ruleset | **Implemented** — 10 evaluators, 12 seeded rules |
 | Document field extraction | **Implemented, heuristic** — text-layer PDFs only, no OCR |
 | OpenAPI documentation | **Implemented** — generated from the code at `/docs` |
-| Tests | **Implemented** — 62 unit, 27 integration against a real database |
+| Tests | **Implemented** — 62 unit, 32 integration against a real database, queue and worker |
 | — | — |
 | AI-assisted document understanding | **Design only** — [Production vision](#production-vision--ai-assisted-compliance-auditing) |
 | OCR for scanned documents | **Design only** |
@@ -310,7 +310,24 @@ it safe is that the key alone is not what identifies the request:
 
 There are three separate anti-duplication mechanisms, at three layers, and none
 replaces another: the idempotency key guards the *request*, the deterministic
-BullMQ job id guards the *job*, and the unique checksum index guards the *content*.
+BullMQ job id guards the *job*, and the unique index on
+`(document_id, checksum_sha256)` guards *the same content in the same slot*.
+
+### De-duplication is scoped to the document slot
+
+Worth stating precisely, because getting the scope wrong is costly. The same
+bytes uploaded **to the same slot** are a retry. The same bytes uploaded **to a
+different tender** are a different document and must be recorded as one.
+
+A contractor submits one SBU, one NIB and one NPWP to every tender they bid for
+— that is the normal case, not an edge case. Scoping de-duplication to the
+tenant therefore discarded the second tender's upload while answering `202`, and
+the audit then reported the document as never uploaded. The index now lives on
+`(document_id, checksum_sha256)`.
+
+Storage is still de-duplicated: object keys are content-addressed per tenant, so
+one certificate across twelve tenders is **one object and twelve version rows**.
+The second upload writes a row and no bytes.
 
 ---
 
@@ -364,10 +381,22 @@ rewrite.
 
 ### 3 · Queue and workers
 
-**Deterministic job ids.** The job id is `ingest-<sha256>`. A retried request, a
-duplicated storage event and a double-click all resolve to the same job and
-BullMQ ignores the duplicate. Combined with the unique checksum index, delivery
-is at-least-once and *effect* is exactly-once.
+**Publish after commit.** The `ingestion_jobs` row is written and committed
+*before* the job is published. The row is the record of intent; the publish acts
+on it. Publishing first lets a worker start against state that is not yet
+durable — it drove documents to `processed` and the API's later commit then
+overwrote that back to `queued`, stranding 24% of a 40-upload burst as
+"permanently queued" with a completed extraction. If the publish fails after the
+commit, the row sits in `queued` with no live job, which is visible and is
+re-published by the client's next retry.
+
+**Deterministic job ids.** The job id is `ingest-<versionId>` — derived from the
+version, because the version is the unit of work. (A content-derived id looks
+tempting until one certificate goes to two tenders: two versions, two extraction
+rows, one id, collision.) A retried request resolves to the version it already
+created and therefore to the same job id, which BullMQ ignores as a duplicate.
+Combined with the slot-scoped checksum index, delivery is at-least-once and
+*effect* is exactly-once.
 
 **Priority by document class.** Qualification documents (SBU, SKK, KSWP) gate the
 whole bid and are small; technical attachments are large and can wait. Under a
@@ -389,13 +418,21 @@ this table is what answers "which documents failed last Tuesday and why".
 worker is singleton-bound. Concurrency within a worker is for I/O overlap
 (storage reads); parallelism across workers is for CPU.
 
-Worked numbers, at ~400 ms of CPU per document:
+**These figures are an arithmetic projection, not a measurement.** They assume
+~400 ms of CPU per document and linear scaling, and neither has been benchmarked
+here. They are included to show the shape of the calculation; treat them as a
+sizing starting point to be replaced by a real load test.
 
-| Workers × cores | Throughput | 5,000 documents |
+| Workers × cores | Projected throughput | 5,000 documents |
 |---|---|---|
 | 1 × 2 | ~5/s | ~17 min |
 | 4 × 2 | ~20/s | ~4 min |
 | 8 × 2 | ~40/s | ~2 min |
+
+What *has* been measured is the correctness of the pipeline under concurrency:
+`test/integration/worker-pipeline.spec.ts` runs the API and a real worker
+together and asserts that every concurrently uploaded document reaches a
+terminal, self-consistent state.
 
 ### 4 · Fairness between tenants
 
@@ -574,7 +611,7 @@ test/                    unit tests + fixtures
 npm test            # 62 unit tests, no services required
 npm run typecheck   # tsc --noEmit, strict
 
-# + 27 integration tests against a real database and queue
+# + 32 integration tests against a real database, queue and worker
 DATABASE_URL=postgres://... REDIS_URL=redis://... npm test
 ```
 
@@ -599,6 +636,17 @@ production disagreed:
 - **tenant isolation** — organisation B gets `404`, not `403`, on A's tender,
   document status and audits. This README claims isolation; this is where that
   claim is checked rather than asserted.
+- **the same certificate filed against two tenders** — both slots filled, two
+  version rows, one stored object.
+
+`test/integration/worker-pipeline.spec.ts` goes further and runs the API **and a
+real worker together** under concurrent load. It exists because the other
+integration suite asserts state immediately after upload and therefore has to
+assume nothing is consuming the queue — an assumption untrue of every real
+deployment, and the one that hid the publish-before-commit race. It asserts that
+every concurrently uploaded document reaches a terminal state and that the
+document, its job row and its extraction agree with each other. Reverting the
+publish ordering makes it fail, which is the only reason to trust it.
 
 `test/integration/schema-drift.spec.ts` additionally selects one row through
 every entity against a migrated database. Because the entities are a
@@ -632,6 +680,39 @@ Stated rather than left for a reviewer to infer:
   indistinguishable by magic bytes; telling them apart means reading
   `[Content_Types].xml`, which belongs in the worker, not the request path.
 
+### Known gaps, stated rather than discovered
+
+These are real and unfixed. They are listed because a reviewer should not have
+to find them, and because a schema that has a column for something is not the
+same as a system that does it.
+
+- **No scheduler.** `compliance_audits.trigger` accepts `scheduled` and
+  `deadline_approaching`, and nothing in the service ever produces them. An
+  audit runs on upload or on request. **A certificate that expires while sitting
+  in a complete bid package is therefore not noticed until something else
+  triggers a re-audit.** Closing this needs a repeatable BullMQ job or
+  `@nestjs/schedule`; the trigger values and audit history already support it.
+- **Ruleset immutability is a convention, not a constraint.** Nothing prevents
+  an `UPDATE` to a ruleset an audit has already cited, which would silently
+  change what that audit meant. The reproducibility argument in ADR 0003 holds
+  only as long as nobody does that. Enforcing it needs a trigger.
+- **`audit_trail` is append-only by convention.** No grant or trigger prevents
+  `UPDATE` or `DELETE`.
+- **Tenant integrity is not enforced by foreign key.** Child rows carry
+  `organization_id` alongside a parent reference, and nothing makes the two
+  agree; a service bug could write a cross-tenant row the database would accept.
+  Composite foreign keys would close this.
+- **No malware scanning.** The `quarantined` lifecycle is for documents that
+  were read and found unusable — no text layer, corrupt, encrypted. It is not an
+  infection verdict.
+- **No pagination.** List endpoints are capped at 100 tenders and 20 audits with
+  no parameters and no total count.
+- **No rate limiting.** The upload endpoint is unbounded per tenant.
+- **Pre-signed upload URLs are modelled, not wired up.**
+  `StorageService.createUploadUrl` exists and is described above as the
+  production path for large files, but no endpoint calls it and no test covers
+  it.
+
 ## Decisions
 
 - [ADR 0001 — SQL-first schema, ORM as a mapping layer](docs/adr/0001-sql-first-schema.md)
@@ -643,9 +724,17 @@ Stated rather than left for a reviewer to infer:
 
 The schema is plain PostgreSQL and applies to Supabase unchanged.
 
-- **Isolation** — every tenant table carries `organization_id`, so one RLS
-  policy per table (`organization_id = auth.jwt() ->> 'org_id'`) enforces
-  isolation at the database boundary rather than in application code.
+- **Isolation** — **RLS is not implemented.** There is no `CREATE POLICY` in
+  this repository; tenant isolation today is enforced entirely in application
+  queries and verified by integration test, not at the database boundary.
+
+  When it is added, it will not be one uniform policy per table. Most tenant
+  tables carry `organization_id` and take the simple form
+  (`organization_id = auth.jwt() ->> 'org_id'`), but `document_extractions` and
+  `compliance_findings` have no such column — they are reached through their
+  parent — so those need join-based policies, which are more expensive and must
+  be index-supported. `document_types`, `compliance_rulesets` and
+  `compliance_rules` are global reference data and are excluded by design.
 - **Connections** — use the pooled connection string (port 6543, PgBouncer
   transaction mode) for workers; the direct connection for migrations.
 - **Storage** — Supabase Storage is S3-compatible, so `STORAGE_ENDPOINT` and

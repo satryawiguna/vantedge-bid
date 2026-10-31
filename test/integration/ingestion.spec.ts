@@ -30,6 +30,8 @@ describeIfDatabase('document ingestion (integration)', () => {
   const orgB = randomUUID();
   const runId = randomUUID();
   let tenderA: string;
+  /** A second tender in the SAME organisation — the cross-tender case. */
+  let tenderA2: string;
   let tenderB: string;
 
   const sbuPdf = (marker: string) =>
@@ -84,6 +86,7 @@ describeIfDatabase('document ingestion (integration)', () => {
     }
 
     tenderA = await seedTender(dataSource, orgA, `A-${runId.slice(0, 8)}`);
+    tenderA2 = await seedTender(dataSource, orgA, `A2-${runId.slice(0, 8)}`);
     tenderB = await seedTender(dataSource, orgB, `B-${runId.slice(0, 8)}`);
   }, 60_000);
 
@@ -111,7 +114,12 @@ describeIfDatabase('document ingestion (integration)', () => {
         'SELECT lifecycle, organization_id, storage_key FROM document_versions WHERE id = $1',
         [versionId],
       );
-      expect(version.lifecycle).toBe('queued');
+      // A member of the set, not a fixed value. This suite does not run a
+      // worker, but asserting the exact string made the test depend on nothing
+      // consuming the queue — an assumption untrue of every real deployment,
+      // and the one that hid the publish-before-commit race. The terminal
+      // states live in worker-pipeline.spec.ts, which does run a worker.
+      expect(['queued', 'processing', 'processed']).toContain(version.lifecycle);
       expect(version.organization_id).toBe(orgA);
 
       // The slot now points at this version — the single-row lookup the read
@@ -176,6 +184,57 @@ describeIfDatabase('document ingestion (integration)', () => {
         [first.body.checksum],
       );
       expect(count).toBe(1);
+    });
+
+    it('files the same certificate against every tender that needs it', async () => {
+      // The defect this exists for: de-duplication was scoped to the tenant, so
+      // the second tender's upload was answered 202 and discarded, and the
+      // audit then reported the document as never uploaded. A contractor
+      // submitting one SBU to every tender they bid for is the normal case.
+      const pdf = sbuPdf(`SHARED-${runId}`);
+
+      const first = await attach(post(tenderA, orgA), pdf)
+        .field('documentTypeCode', 'AKTA_PENDIRIAN')
+        .expect(202);
+
+      const second = await attach(post(tenderA2, orgA), pdf)
+        .field('documentTypeCode', 'AKTA_PENDIRIAN')
+        .expect(202);
+
+      expect(second.body.deduplicated).toBe(false);
+      expect(second.body.versionId).not.toBe(first.body.versionId);
+      expect(second.body.documentId).not.toBe(first.body.documentId);
+
+      // Both slots are filled...
+      for (const body of [first.body, second.body]) {
+        const [slot] = await dataSource.query(
+          'SELECT current_version_id FROM tender_documents WHERE id = $1',
+          [body.documentId],
+        );
+        expect(slot.current_version_id).toBe(body.versionId);
+      }
+
+      // ...and the bytes were stored once, not twice.
+      const keys = await dataSource.query(
+        'SELECT DISTINCT storage_key FROM document_versions WHERE checksum_sha256 = $1',
+        [first.body.checksum],
+      );
+      expect(keys).toHaveLength(1);
+    });
+
+    it('still treats a repeat into the same slot as a retry', async () => {
+      const pdf = sbuPdf(`SAMESLOT-${runId}`);
+
+      const first = await attach(post(tenderA, orgA), pdf)
+        .field('documentTypeCode', 'RKK')
+        .expect(202);
+
+      const repeat = await attach(post(tenderA, orgA), pdf)
+        .field('documentTypeCode', 'RKK')
+        .expect(202);
+
+      expect(repeat.body.deduplicated).toBe(true);
+      expect(repeat.body.versionId).toBe(first.body.versionId);
     });
 
     it('creates a second version when the same slot receives different bytes', async () => {

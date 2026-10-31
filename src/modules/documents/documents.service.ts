@@ -17,7 +17,13 @@ import {
 import { DocumentLifecycle, TenderStatus } from '../../database/enums';
 import { StorageService } from '../../storage/storage.service';
 import { IngestionQueueService } from '../ingestion/ingestion.queue';
-import { DEFAULT_PRIORITY, PRIORITY_BY_CATEGORY } from '../ingestion/ingestion.constants';
+import {
+  DEFAULT_PRIORITY,
+  INGESTION_QUEUE,
+  IngestionJobPayload,
+  PRIORITY_BY_CATEGORY,
+  ingestionJobId,
+} from '../ingestion/ingestion.constants';
 import { FileValidatorService, ValidatedFile } from './validation/file-validator.service';
 import { IngestDocumentDto } from './dto/ingest-document.dto';
 import { IngestDocumentResponseDto } from './dto/ingest-document-response.dto';
@@ -131,17 +137,29 @@ export class DocumentsService {
   }): Promise<IngestDocumentResponseDto> {
     const { context, tender, dto, documentType, validated } = params;
 
-    // Identical bytes already stored for this tenant: nothing to upload, nothing
-    // to process. Answering with the existing record keeps retries cheap and
-    // stops a flaky client from multiplying storage cost.
-    const duplicate = await this.findDuplicate(context.organizationId, validated.checksumSha256);
-    if (duplicate) {
+    // A true retry: these exact bytes are already recorded against this tender's
+    // slot. Only this case is a duplicate.
+    //
+    // De-duplicating any wider than the slot is what made uploads disappear: a
+    // contractor submits the same SBU to every tender they bid for, and a
+    // tenant-wide check treated the second tender's upload as a repeat, answered
+    // 202, and left that tender's slot empty.
+    const retry = await this.findRetryInTender(tender.id, dto.documentId, validated.checksumSha256);
+    if (retry) {
       this.logger.log(
-        { checksum: validated.checksumSha256, versionId: duplicate.id },
-        'Upload de-duplicated against an existing version',
+        { checksum: validated.checksumSha256, versionId: retry.id },
+        'Upload matched an existing version in the same slot',
       );
-      return this.toResponse(duplicate, documentType.code, true);
+      return this.resumeIfStalled(retry, tender, documentType);
     }
+
+    // The same bytes may already be stored for this tenant under a different
+    // slot. Storage is content-addressed, so that object is reusable: a new
+    // version row is still created, but no bytes are written.
+    const storedAlready = await this.hasStoredContent(
+      context.organizationId,
+      validated.checksumSha256,
+    );
 
     const { document, version, storageKey } = await this.dataSource.transaction(
       async (manager): Promise<{ document: TenderDocument; version: DocumentVersion; storageKey: string }> => {
@@ -156,8 +174,6 @@ export class DocumentsService {
 
         const key = StorageService.buildObjectKey({
           organizationId: context.organizationId,
-          tenderId: tender.id,
-          documentId: slot.id,
           checksum: validated.checksumSha256,
           extension: validated.extension,
         });
@@ -200,20 +216,22 @@ export class DocumentsService {
 
     // --- outside the transaction: the slow, non-transactional parts ----------
 
-    try {
-      await this.storage.put({
-        key: storageKey,
-        body: validated.buffer,
-        contentType: validated.mimeType,
-        originalFilename: validated.originalFilename,
-        metadata: {
-          'organization-id': context.organizationId,
-          'document-type': documentType.code,
-        },
-      });
-    } catch (error) {
-      await this.markVersionFailed(version.id, 'Upload to object storage failed.');
-      throw error;
+    if (!storedAlready) {
+      try {
+        await this.storage.put({
+          key: storageKey,
+          body: validated.buffer,
+          contentType: validated.mimeType,
+          originalFilename: validated.originalFilename,
+          metadata: {
+            'organization-id': context.organizationId,
+            'document-type': documentType.code,
+          },
+        });
+      } catch (error) {
+        await this.markVersionFailed(version.id, 'Upload to object storage failed.');
+        throw error;
+      }
     }
 
     const priority = PRIORITY_BY_CATEGORY[documentType.category] ?? DEFAULT_PRIORITY;
@@ -294,13 +312,93 @@ export class DocumentsService {
     }
   }
 
-  private async findDuplicate(
-    organizationId: string,
+  /**
+   * Has this content already been recorded against this tender?
+   *
+   * Scoped to the tender, and to one slot when the caller named it. Anything
+   * wider would treat a legitimate submission of the same certificate to
+   * another tender as a duplicate.
+   */
+  private async findRetryInTender(
+    tenderId: string,
+    documentId: string | undefined,
     checksum: string,
   ): Promise<DocumentVersion | null> {
-    return this.dataSource
+    const query = this.dataSource
+      .getRepository(DocumentVersion)
+      .createQueryBuilder('version')
+      .innerJoin(TenderDocument, 'slot', 'slot.id = version.document_id')
+      .where('slot.tender_id = :tenderId', { tenderId })
+      .andWhere('slot.deleted_at IS NULL')
+      .andWhere('version.checksum_sha256 = :checksum', { checksum })
+      .orderBy('version.version_no', 'DESC');
+
+    if (documentId) {
+      query.andWhere('version.document_id = :documentId', { documentId });
+    }
+
+    return query.getOne();
+  }
+
+  /** Is this content already in object storage for this tenant? */
+  private async hasStoredContent(organizationId: string, checksum: string): Promise<boolean> {
+    const existing = await this.dataSource
       .getRepository(DocumentVersion)
       .findOneBy({ organizationId, checksumSha256: checksum });
+    return existing !== null;
+  }
+
+  /**
+   * Answer a retry, re-publishing the job if the original never reached a
+   * worker.
+   *
+   * Enqueueing happens after the state transaction commits, so a broker outage
+   * can leave a row recorded as `queued` with no live job. Rather than needing a
+   * sweeper for that window, a retry of the same upload — which is what a client
+   * does anyway — re-publishes it. The job id is deterministic, so this is a
+   * no-op when the job is still there.
+   */
+  private async resumeIfStalled(
+    version: DocumentVersion,
+    tender: Tender,
+    documentType: DocumentType,
+  ): Promise<IngestDocumentResponseDto> {
+    const jobId = ingestionJobId(version.id);
+    const stalled =
+      version.lifecycle === DocumentLifecycle.Queued ||
+      version.lifecycle === DocumentLifecycle.Pending;
+
+    if (stalled && (await this.queue.getJobState(jobId)) === null) {
+      this.logger.warn(
+        { versionId: version.id, jobId },
+        'Version was recorded as queued but has no job; re-publishing',
+      );
+      await this.queue.enqueue(
+        this.buildPayload(version, tender, documentType),
+        PRIORITY_BY_CATEGORY[documentType.category] ?? DEFAULT_PRIORITY,
+        jobId,
+      );
+    }
+
+    return this.toResponse(version, documentType.code, true, jobId);
+  }
+
+  private buildPayload(
+    version: DocumentVersion,
+    tender: Tender,
+    documentType: DocumentType,
+  ): IngestionJobPayload {
+    return {
+      versionId: version.id,
+      documentId: version.documentId,
+      tenderId: tender.id,
+      organizationId: version.organizationId,
+      documentTypeCode: documentType.code,
+      storageBucket: version.storageBucket,
+      storageKey: version.storageKey,
+      checksum: version.checksumSha256,
+      mimeType: version.mimeType,
+    };
   }
 
   private async resolveDocumentSlot(
@@ -383,22 +481,22 @@ export class DocumentsService {
     priority: number;
   }): Promise<string> {
     const { version, document, tender, documentType, priority } = params;
+    const jobId = ingestionJobId(version.id);
 
-    const jobId = await this.queue.enqueue(
-      {
-        versionId: version.id,
-        documentId: document.id,
-        tenderId: tender.id,
-        organizationId: version.organizationId,
-        documentTypeCode: documentType.code,
-        storageBucket: version.storageBucket,
-        storageKey: version.storageKey,
-        checksum: version.checksumSha256,
-        mimeType: version.mimeType,
-      },
-      priority,
-    );
-
+    // Record the intent, commit, and only then publish.
+    //
+    // The original ordering published first. A worker would pick the job up
+    // within milliseconds, drive the version to `processed` and update an
+    // `ingestion_jobs` row that did not exist yet — matching zero rows — and
+    // then this transaction would commit, overwriting `processed` back to
+    // `queued` and inserting a fresh job row. Under a 40-upload burst that
+    // stranded 24% of documents in `queued` with a completed extraction, and the
+    // client polling for status never saw them finish.
+    //
+    // With the publish last, the committed row is the record of intent and the
+    // worker can only ever see state that is already durable. If the publish
+    // then fails, the row sits in `queued` with no live job — visible, and
+    // recovered by `resumeIfStalled` on the client's next retry.
     await this.dataSource.transaction(async (manager) => {
       await manager
         .getRepository(DocumentVersion)
@@ -411,11 +509,17 @@ export class DocumentsService {
       await manager.getRepository(IngestionJob).insert({
         organizationId: version.organizationId,
         versionId: version.id,
-        queueName: 'document-ingestion',
+        queueName: INGESTION_QUEUE,
         jobKey: jobId,
         priority,
       });
     });
+
+    await this.queue.enqueue(
+      this.buildPayload({ ...version, documentId: document.id }, tender, documentType),
+      priority,
+      jobId,
+    );
 
     return jobId;
   }
@@ -430,7 +534,7 @@ export class DocumentsService {
     version: DocumentVersion,
     documentTypeCode: string,
     deduplicated: boolean,
-    jobId = `ingest-${version.checksumSha256}`,
+    jobId = ingestionJobId(version.id),
   ): IngestDocumentResponseDto {
     return {
       documentId: version.documentId,
