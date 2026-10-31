@@ -16,7 +16,10 @@ export const ErrorCode = {
 
   // 409 — the request is well formed but conflicts with current state
   DUPLICATE_DOCUMENT: 'duplicate_document',
+  /** Same key, different request — the caller must pick a new key. */
   IDEMPOTENCY_KEY_REUSED: 'idempotency_key_reused',
+  /** Same key, same request, still running — the caller should retry shortly. */
+  IDEMPOTENT_REQUEST_IN_PROGRESS: 'idempotent_request_in_progress',
 
   // 413 / 415 — the file itself is rejected
   FILE_TOO_LARGE: 'file_too_large',

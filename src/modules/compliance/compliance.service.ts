@@ -51,16 +51,7 @@ export class ComplianceService {
   }): Promise<ComplianceAudit> {
     const { organizationId, tenderId, trigger } = params;
 
-    const ruleset = await this.dataSource
-      .getRepository(ComplianceRuleset)
-      .findOneBy({ code: RULESET_CODE, isActive: true });
-
-    if (!ruleset) {
-      throw AppError.internal(
-        ErrorCode.INTERNAL_ERROR,
-        `No active compliance ruleset "${RULESET_CODE}". Run the seed migration.`,
-      );
-    }
+    const ruleset = await this.resolveRuleset(RULESET_CODE, new Date());
 
     const context = await this.buildContext(organizationId, tenderId);
 
@@ -154,6 +145,51 @@ export class ComplianceService {
   }
 
   // ---------------------------------------------------------------------------
+
+  /**
+   * Pick the ruleset to audit under.
+   *
+   * `is_active` and the effective window answer different questions, and both
+   * have to hold. `is_active` is the operator's switch — which version of this
+   * ruleset the product is currently running, enforced as one per code by a
+   * partial unique index. `effective_from`/`effective_to` are the regulator's
+   * calendar — when that version actually applies.
+   *
+   * Selecting on `is_active` alone, as this did originally, makes the two date
+   * columns decorative: a v2 prepared in October for a January rule change
+   * would take effect the moment someone flipped the switch. Requiring both
+   * means a future version can be loaded, reviewed and staged in advance, and
+   * still start applying on the date it is supposed to.
+   */
+  private async resolveRuleset(code: string, asOf: Date): Promise<ComplianceRuleset> {
+    const today = asOf.toISOString().slice(0, 10);
+
+    const ruleset = await this.dataSource
+      .getRepository(ComplianceRuleset)
+      .createQueryBuilder('ruleset')
+      .where('ruleset.code = :code', { code })
+      .andWhere('ruleset.is_active = true')
+      .andWhere('ruleset.effective_from <= :today', { today })
+      .andWhere('(ruleset.effective_to IS NULL OR ruleset.effective_to > :today)', { today })
+      .getOne();
+
+    if (ruleset) return ruleset;
+
+    // Distinguish "nothing seeded" from "seeded but not in force today" — the
+    // two have completely different fixes, and a single generic message would
+    // send an operator looking in the wrong place.
+    const anyVersion = await this.dataSource
+      .getRepository(ComplianceRuleset)
+      .findOneBy({ code, isActive: true });
+
+    throw AppError.internal(
+      ErrorCode.INTERNAL_ERROR,
+      anyVersion
+        ? `Compliance ruleset "${code}" v${anyVersion.version} is active but not in force on ${today} ` +
+            `(effective ${anyVersion.effectiveFrom} to ${anyVersion.effectiveTo ?? 'open'}).`
+        : `No active compliance ruleset "${code}". Run the seed migration.`,
+    );
+  }
 
   private evaluate(
     rules: ComplianceRule[],

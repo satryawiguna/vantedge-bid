@@ -21,6 +21,12 @@ export interface ExtractedFields {
   expiresAt: string | null;
   classificationCodes: string[];
   monetaryValue: string | null;
+  /**
+   * Fields that only this document type carries. Kept out of the named fields
+   * above because adding a column per document type produces a table that is
+   * mostly NULL; see document_extractions.extracted_data.
+   */
+  extras: Record<string, unknown>;
   confidence: number;
 }
 
@@ -81,8 +87,58 @@ export function extractFields(text: string, documentTypeCode: string): Extracted
     expiresAt,
     classificationCodes,
     monetaryValue,
+    extras: findExtras(normalised, documentTypeCode),
     confidence,
   };
+}
+
+/**
+ * Document-type-specific fields.
+ *
+ * Deliberately narrow: only what this document type actually prints and what a
+ * reviewer might later want to filter or rule on. Everything found here is a
+ * candidate for promotion to a real column once something queries it.
+ */
+function findExtras(text: string, documentTypeCode: string): Record<string, unknown> {
+  const extras: Record<string, unknown> = {};
+
+  switch (documentTypeCode) {
+    case 'SBU': {
+      // Kualifikasi: Kecil / Menengah / Besar — decides which package sizes the
+      // contractor may bid for at all.
+      const grade = text.match(/kualifikasi\s*[:\-]?\s*(kecil|menengah|besar)/i);
+      if (grade) extras.qualificationGrade = grade[1].toLowerCase();
+      break;
+    }
+
+    case 'NIB': {
+      // KBLI business activity codes, five digits each.
+      const codes = [...text.matchAll(/\bKBLI\D{0,20}(\d{5})\b/gi)].map((match) => match[1]);
+      if (codes.length > 0) extras.kbliCodes = [...new Set(codes)];
+      break;
+    }
+
+    case 'JAMINAN_PENAWARAN': {
+      // Who stands behind the bond. Some announcements restrict which banks or
+      // insurers are acceptable.
+      const guarantor = text.match(
+        /(?:penjamin|penerbit\s+jaminan|diterbitkan\s+oleh)\s*[:\-]?\s*((?:PT|Bank)\s[A-Za-z0-9.&' ]{2,50}?)(?=\s*(?:Nomor|Nilai|Untuk|Berlaku|[:,])|$)/i,
+      );
+      if (guarantor) extras.guarantor = guarantor[1].trim();
+      break;
+    }
+
+    case 'SKK_PERSONIL': {
+      const level = text.match(/jenjang\s*[:\-]?\s*(\d{1,2})/i);
+      if (level) extras.competencyLevel = Number.parseInt(level[1], 10);
+      break;
+    }
+
+    default:
+      break;
+  }
+
+  return extras;
 }
 
 function expectedFieldsFor(documentTypeCode: string): string[] {

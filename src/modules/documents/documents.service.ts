@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { HttpStatus, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { createHash } from 'node:crypto';
@@ -18,7 +18,7 @@ import { DocumentLifecycle, TenderStatus } from '../../database/enums';
 import { StorageService } from '../../storage/storage.service';
 import { IngestionQueueService } from '../ingestion/ingestion.queue';
 import { DEFAULT_PRIORITY, PRIORITY_BY_CATEGORY } from '../ingestion/ingestion.constants';
-import { FileValidatorService } from './validation/file-validator.service';
+import { FileValidatorService, ValidatedFile } from './validation/file-validator.service';
 import { IngestDocumentDto } from './dto/ingest-document.dto';
 import { IngestDocumentResponseDto } from './dto/ingest-document-response.dto';
 
@@ -60,11 +60,6 @@ export class DocumentsService {
   }): Promise<{ body: IngestDocumentResponseDto; replayed: boolean }> {
     const { context, tenderId, dto, file, idempotencyKey } = params;
 
-    if (idempotencyKey) {
-      const replay = await this.findIdempotentReplay(context.organizationId, idempotencyKey);
-      if (replay) return { body: replay, replayed: true };
-    }
-
     const tender = await this.loadTender(context.organizationId, tenderId);
     this.assertTenderAcceptsUploads(tender);
 
@@ -85,6 +80,57 @@ export class DocumentsService {
       globalMaxBytes: this.uploadMaxBytes,
     });
 
+    // The idempotency check sits here, after validation, not at the top of the
+    // method. The request fingerprint has to cover the file's contents, and that
+    // hash is a by-product of validation. Checking first would force a choice
+    // between hashing a 50 MB body before discovering it is oversized, and
+    // fingerprinting the form fields alone — which would treat "same key,
+    // different file" as a retry and hand back a response describing a document
+    // the caller did not send.
+    const requestHash = fingerprintRequest(tenderId, dto, validated.checksumSha256);
+    let holdsClaim = false;
+
+    if (idempotencyKey) {
+      const claim = await this.claimIdempotencyKey({
+        organizationId: context.organizationId,
+        key: idempotencyKey,
+        requestHash,
+      });
+
+      if (claim.outcome === 'replay') {
+        return { body: claim.body, replayed: true };
+      }
+      holdsClaim = true;
+    }
+
+    try {
+      const body = await this.persist({ context, tender, dto, documentType, validated });
+
+      if (holdsClaim) {
+        await this.completeClaim(context.organizationId, idempotencyKey!, body);
+      }
+      return { body, replayed: false };
+    } catch (error) {
+      // A failed attempt must not hold the key for the next 24 hours. The client
+      // has to be able to retry the same upload under the same key once whatever
+      // broke is fixed.
+      if (holdsClaim) {
+        await this.releaseClaim(context.organizationId, idempotencyKey!);
+      }
+      throw error;
+    }
+  }
+
+  /** Everything after validation: de-duplicate, record, store, queue. */
+  private async persist(params: {
+    context: OrganizationContext;
+    tender: Tender;
+    dto: IngestDocumentDto;
+    documentType: DocumentType;
+    validated: ValidatedFile;
+  }): Promise<IngestDocumentResponseDto> {
+    const { context, tender, dto, documentType, validated } = params;
+
     // Identical bytes already stored for this tenant: nothing to upload, nothing
     // to process. Answering with the existing record keeps retries cheap and
     // stops a flaky client from multiplying storage cost.
@@ -94,7 +140,7 @@ export class DocumentsService {
         { checksum: validated.checksumSha256, versionId: duplicate.id },
         'Upload de-duplicated against an existing version',
       );
-      return { body: this.toResponse(duplicate, documentType.code, true), replayed: false };
+      return this.toResponse(duplicate, documentType.code, true);
     }
 
     const { document, version, storageKey } = await this.dataSource.transaction(
@@ -179,18 +225,12 @@ export class DocumentsService {
       priority,
     });
 
-    const body = this.toResponse(
+    return this.toResponse(
       { ...version, lifecycle: DocumentLifecycle.Queued },
       documentType.code,
       false,
       jobId,
     );
-
-    if (idempotencyKey) {
-      await this.recordIdempotentResponse(context.organizationId, idempotencyKey, dto, body);
-    }
-
-    return { body, replayed: false };
   }
 
   async getVersionStatus(context: OrganizationContext, versionId: string) {
@@ -408,34 +448,122 @@ export class DocumentsService {
 
   // --- idempotency -----------------------------------------------------------
 
-  private async findIdempotentReplay(
-    organizationId: string,
-    key: string,
-  ): Promise<IngestDocumentResponseDto | null> {
-    const [row] = await this.dataSource.query<
-      Array<{ response_body: IngestDocumentResponseDto | null }>
+  /**
+   * Claim the key before doing the work, rather than checking for a stored
+   * response and then writing one.
+   *
+   * Check-then-act loses the race: two concurrent requests carrying the same key
+   * both see no stored response and both do the work. Claiming with a
+   * conditional INSERT makes the database the arbiter — exactly one caller gets
+   * the row, and the loser can be told what is happening instead of silently
+   * duplicating an upload.
+   *
+   * The conflict clause also re-claims an expired key, so a key stops being
+   * reserved once its 24-hour window has passed.
+   */
+  private async claimIdempotencyKey(params: {
+    organizationId: string;
+    key: string;
+    requestHash: string;
+  }): Promise<{ outcome: 'claimed' } | { outcome: 'replay'; body: IngestDocumentResponseDto }> {
+    const { organizationId, key, requestHash } = params;
+
+    const claimed = await this.dataSource.query<Array<{ key: string }>>(
+      `INSERT INTO idempotency_keys (organization_id, key, endpoint, request_hash)
+            VALUES ($1, $2, $3, $4)
+       ON CONFLICT (organization_id, key) DO UPDATE
+           SET request_hash    = EXCLUDED.request_hash,
+               response_status = NULL,
+               response_body   = NULL,
+               created_at      = now(),
+               expires_at      = now() + interval '24 hours'
+         WHERE idempotency_keys.expires_at <= now()
+     RETURNING key`,
+      [organizationId, key, IDEMPOTENT_ENDPOINT, requestHash],
+    );
+
+    if (claimed.length > 0) return { outcome: 'claimed' };
+
+    const [existing] = await this.dataSource.query<
+      Array<{ request_hash: string; response_body: IngestDocumentResponseDto | null }>
     >(
-      `SELECT response_body FROM idempotency_keys
-        WHERE organization_id = $1 AND key = $2 AND expires_at > now()`,
+      `SELECT request_hash, response_body FROM idempotency_keys
+        WHERE organization_id = $1 AND key = $2`,
       [organizationId, key],
     );
-    return row?.response_body ?? null;
+
+    if (!existing) {
+      // The row expired between the insert and this read. Treat the key as free.
+      return { outcome: 'claimed' };
+    }
+
+    // Same key, different request. Returning the stored response here would
+    // tell the caller their NIB upload succeeded when what is stored is an SBU.
+    // Refusing is the only honest answer.
+    if (existing.request_hash !== requestHash) {
+      throw AppError.conflict(
+        ErrorCode.IDEMPOTENCY_KEY_REUSED,
+        'This Idempotency-Key was already used for a different request. Use a new key.',
+        { key },
+      );
+    }
+
+    if (existing.response_body === null) {
+      // Same request, still in flight. Not an error the client caused, so it is
+      // told to come back rather than given a half-finished answer.
+      throw new AppError({
+        code: ErrorCode.IDEMPOTENT_REQUEST_IN_PROGRESS,
+        status: HttpStatus.CONFLICT,
+        message: 'An identical request with this Idempotency-Key is still being processed.',
+        details: { key },
+      });
+    }
+
+    return { outcome: 'replay', body: existing.response_body };
   }
 
-  private async recordIdempotentResponse(
+  private async completeClaim(
     organizationId: string,
     key: string,
-    dto: IngestDocumentDto,
     body: IngestDocumentResponseDto,
   ): Promise<void> {
-    const requestHash = createHash('sha256').update(JSON.stringify(dto)).digest('hex');
-
     await this.dataSource.query(
-      `INSERT INTO idempotency_keys
-         (organization_id, key, endpoint, request_hash, response_status, response_body)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (organization_id, key) DO NOTHING`,
-      [organizationId, key, 'POST /v1/tenders/:id/documents', requestHash, 202, JSON.stringify(body)],
+      `UPDATE idempotency_keys
+          SET response_status = $3, response_body = $4
+        WHERE organization_id = $1 AND key = $2`,
+      [organizationId, key, HttpStatus.ACCEPTED, JSON.stringify(body)],
     );
   }
+
+  private async releaseClaim(organizationId: string, key: string): Promise<void> {
+    await this.dataSource.query(
+      'DELETE FROM idempotency_keys WHERE organization_id = $1 AND key = $2 AND response_body IS NULL',
+      [organizationId, key],
+    );
+  }
+}
+
+const IDEMPOTENT_ENDPOINT = 'POST /v1/tenders/:tenderId/documents';
+
+/**
+ * What makes two ingestion requests "the same".
+ *
+ * The tender, the form fields and the file's content hash. Two uploads of
+ * byte-identical files with the same metadata are genuinely the same request;
+ * anything else is not, and must not be answered from the first one's response.
+ */
+export function fingerprintRequest(
+  tenderId: string,
+  dto: IngestDocumentDto,
+  checksum: string,
+): string {
+  const canonical = JSON.stringify({
+    tenderId,
+    documentTypeCode: dto.documentTypeCode,
+    documentId: dto.documentId ?? null,
+    title: dto.title ?? null,
+    isMandatory: dto.isMandatory ?? null,
+    checksum,
+  });
+  return createHash('sha256').update(canonical).digest('hex');
 }

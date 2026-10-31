@@ -240,8 +240,14 @@ CREATE TABLE document_extractions (
     expires_at          date,
     classification_codes text[]     NOT NULL DEFAULT '{}',  -- SBU subclassifications found
     monetary_value      numeric(18, 2),             -- e.g. bid bond amount
+    -- Fields that exist only on certain document types: KBLI activity codes on
+    -- an NIB, the qualification grade on an SBU, the guarantor on a bid bond.
+    -- Giving each of those its own column would produce a table that is mostly
+    -- NULL and grows a column per regulation change.
+    extracted_data      jsonb       NOT NULL DEFAULT '{}'::jsonb,
     confidence          numeric(4, 3) NOT NULL DEFAULT 1.000,
     extractor_version   text        NOT NULL,
+    -- Diagnostics about the extraction run itself, not about the document.
     raw                 jsonb       NOT NULL DEFAULT '{}'::jsonb,
     created_at          timestamptz NOT NULL DEFAULT now(),
 
@@ -253,6 +259,15 @@ CREATE TABLE document_extractions (
 
 CREATE INDEX document_extractions_expiry_idx ON document_extractions (expires_at)
     WHERE expires_at IS NOT NULL;
+
+COMMENT ON COLUMN document_extractions.extracted_data IS
+    'Document-type-specific fields. Promotion rule: a field earns a real column once a '
+    'compliance rule, a filter or a join depends on it; until then it lives here. The '
+    'intermediate step, when a field is queried but not yet worth a migration, is a GIN or '
+    'expression index on this column. None is created yet because nothing queries it.';
+
+COMMENT ON COLUMN document_extractions.raw IS
+    'Diagnostics about the extraction run (text length, streams decoded), not document content.';
 
 -- Queue bookkeeping mirrored into Postgres. The broker (Redis/BullMQ) owns the
 -- live state; this table is the durable, queryable history used for retry

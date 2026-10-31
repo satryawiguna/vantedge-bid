@@ -89,6 +89,33 @@ describe('field extraction for Indonesian tender documents', () => {
     expect(fields.monetaryValue).toBe('150000000.00');
   });
 
+  it('puts the SBU qualification grade in extras, not in a column', () => {
+    // Nothing queries the grade yet, so it stays in extracted_data rather than
+    // earning a column of its own.
+    const fields = fieldsFrom([...SBU_LINES, 'Kualifikasi : Menengah']);
+    expect(fields.extras).toEqual({ qualificationGrade: 'menengah' });
+  });
+
+  it('extracts KBLI codes from an NIB', () => {
+    const fields = fieldsFrom(
+      ['NOMOR INDUK BERUSAHA', 'KBLI : 41011 Konstruksi Gedung Hunian', 'KBLI 42101'],
+      'NIB',
+    );
+    expect(fields.extras.kbliCodes).toEqual(['41011', '42101']);
+  });
+
+  it('extracts the guarantor from a bid bond', () => {
+    const fields = fieldsFrom(
+      ['JAMINAN PENAWARAN', 'Penjamin : PT Asuransi Nusantara', 'Nilai Jaminan : Rp 150.000.000,00'],
+      'JAMINAN_PENAWARAN',
+    );
+    expect(fields.extras.guarantor).toBe('PT Asuransi Nusantara');
+  });
+
+  it('leaves extras empty for a document type with no specific fields', () => {
+    expect(fieldsFrom(['PAKTA INTEGRITAS'], 'PAKTA_INTEGRITAS').extras).toEqual({});
+  });
+
   it('reports low confidence when the expected fields are absent', () => {
     const fields = fieldsFrom(['Dokumen tanpa informasi apa pun'], 'SBU');
     expect(fields.confidence).toBeLessThan(0.5);

@@ -59,6 +59,17 @@ export class DocumentExtraction {
   })
   monetaryValue!: string | null;
 
+  /**
+   * Fields that only some document types carry — KBLI codes on an NIB, the
+   * qualification grade on an SBU, the guarantor on a bid bond.
+   *
+   * A field graduates to its own column once a compliance rule, a filter or a
+   * join depends on it. `expires_at` and `holder_npwp` are columns for exactly
+   * that reason; `certificate_grade` is not, because nothing reads it yet.
+   */
+  @Column({ name: 'extracted_data', type: 'jsonb', default: () => "'{}'::jsonb" })
+  extractedData!: Record<string, unknown>;
+
   @Column({
     type: 'numeric',
     precision: 4,
@@ -74,6 +85,7 @@ export class DocumentExtraction {
   @Column({ name: 'extractor_version', type: 'text' })
   extractorVersion!: string;
 
+  /** Diagnostics about the extraction run, not about the document. */
   @Column({ type: 'jsonb', default: () => "'{}'::jsonb" })
   raw!: Record<string, unknown>;
 

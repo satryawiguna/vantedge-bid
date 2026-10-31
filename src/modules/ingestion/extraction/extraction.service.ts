@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
+import { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import { DocumentExtraction } from '../../../database/entities';
 import { StorageService } from '../../../storage/storage.service';
 import { extractPdfText } from './pdf-text-extractor';
@@ -69,8 +70,14 @@ export class ExtractionService {
       expiresAt: fields.expiresAt,
       classificationCodes: fields.classificationCodes,
       monetaryValue: fields.monetaryValue,
+      // Same TypeORM limitation as in ComplianceService: QueryDeepPartialEntity
+      // has no deep-partial form for a jsonb column typed Record<string, unknown>.
+      // Cast localised here rather than weakening the entity to `any`.
+      extractedData: fields.extras as QueryDeepPartialEntity<Record<string, unknown>>,
       confidence: fields.confidence,
       extractorVersion: EXTRACTOR_VERSION,
+      // Diagnostics about the run, kept apart from document content so a
+      // query over extracted_data never has to step around them.
       raw: { textLength: text.length, streamsDecoded, streamsTotal },
     });
 

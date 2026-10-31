@@ -140,6 +140,23 @@ replaces the extraction row and leaves the immutable file record alone. Full
 document text is **not** stored in Postgres — only a `text_storage_key` pointing
 at object storage, so rows stay small and the table stays cacheable.
 
+### Three kinds of extraction data, kept apart
+
+The fields an extractor produces differ by document type, so the table splits
+them three ways rather than giving every possible field a column
+([ADR 0004](adr/0004-hybrid-extraction-storage.md)):
+
+| | Holds | Why there |
+|---|---|---|
+| Columns | `expires_at`, `holder_npwp`, `classification_codes`, `monetary_value`, … | A compliance rule, filter or index depends on them |
+| `extracted_data` (jsonb) | `kbliCodes`, `qualificationGrade`, `guarantor` | Specific to one document type; nothing queries them yet |
+| `raw` (jsonb) | `textLength`, `streamsDecoded` | Diagnostics about the parser run, not about the document |
+
+A field is promoted from `extracted_data` to a column when something starts
+querying it; the step in between is an expression or GIN index. Keeping `raw`
+out of `extracted_data` means a query over document fields never has to step
+around keys that describe the parser instead of the paper.
+
 ### Document lifecycle
 
 ```
@@ -230,6 +247,23 @@ not defend its own history. So:
 
 Re-running an old audit reproduces the old verdict. That property is the whole
 point of the module.
+
+### `is_active` and the effective window are different questions
+
+Both gate which ruleset an audit runs under, and both have to hold:
+
+- **`is_active`** is the operator's switch — which version the product is
+  currently running. A partial unique index allows one per ruleset code.
+- **`effective_from` / `effective_to`** is the regulator's calendar — when that
+  version actually applies.
+
+Selecting on `is_active` alone would make the date columns decorative: a v2
+prepared in October for a January rule change would take effect the moment
+someone flipped the switch. Requiring both lets a future version be loaded,
+reviewed and staged in advance and still start applying on the right date.
+`ComplianceService.resolveRuleset` enforces both, and distinguishes "nothing
+seeded" from "seeded but not yet in force" in its error, because those have
+completely different fixes.
 
 ### Finding statuses
 

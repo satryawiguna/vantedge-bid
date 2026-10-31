@@ -25,6 +25,36 @@ about. The data model and the pipeline are both shaped by that.
 
 ---
 
+## What runs, and what is only designed
+
+Everything below the first line of this table is working code with tests behind
+it. Everything below the second is reasoning about production, written down so
+the design can be judged — not implemented, and not claimed to be.
+
+| | Status |
+|---|---|
+| PostgreSQL schema, ERD, migrations | **Implemented** — 14 tables, applied by `npm run migrate` |
+| Document ingestion REST API with size and format validation | **Implemented** — 8-stage gate, [below](#validation-gate) |
+| Queue and worker, asynchronous processing | **Implemented** — BullMQ, separate process |
+| Content de-duplication and request idempotency | **Implemented** — enforced by the database |
+| Rule-based compliance engine over a versioned ruleset | **Implemented** — 10 evaluators, 12 seeded rules |
+| Document field extraction | **Implemented, heuristic** — text-layer PDFs only, no OCR |
+| OpenAPI documentation | **Implemented** — generated from the code at `/docs` |
+| Tests | **Implemented** — 62 unit, 27 integration against a real database |
+| — | — |
+| AI-assisted document understanding | **Design only** — [Production vision](#production-vision--ai-assisted-compliance-auditing) |
+| OCR for scanned documents | **Design only** |
+| Human-in-the-loop review workflow | **Design only** |
+| Authentication | **Out of scope** — [deliberately](#deliberate-scope-boundaries), with the seam left in place |
+
+The brief asked for an ERD, an ingestion endpoint with basic validation, and a
+written scaling strategy. This goes further than that in one specific direction:
+the compliance engine actually runs, because a schema for compliance auditing
+that has never evaluated a rule is a guess. Everything else is deliberately
+bounded, and the boundaries are stated rather than left to be discovered.
+
+---
+
 ## Quick start
 
 ```bash
@@ -254,11 +284,33 @@ at, so a human can check its work rather than trust it.
 
 `file_missing` · `file_empty` · `file_too_large` · `unsupported_media_type` ·
 `file_signature_mismatch` · `file_encrypted` · `duplicate_document` ·
+`idempotency_key_reused` · `idempotent_request_in_progress` ·
 `tender_not_found` · `document_type_not_found` · `tender_deadline_passed` ·
 `storage_unavailable` · `queue_unavailable` · `internal_error`
 
 Clients branch on the code, never on the message. 5xx responses never echo an
 internal message; the detail is logged against the request id instead.
+
+### Idempotency
+
+Send an `Idempotency-Key` header and a retry after a timeout is safe. What makes
+it safe is that the key alone is not what identifies the request:
+
+- **Same key, same request** → the stored response, with `Idempotent-Replay: true`.
+  "Same request" means the same tender, the same form fields *and* the same file
+  bytes, fingerprinted together.
+- **Same key, different request** → `409 idempotency_key_reused`. Replaying the
+  first response here would tell a caller their NIB upload succeeded when what
+  is stored is an SBU. Refusing is the only honest answer.
+- **Same key, same request, still running** → `409 idempotent_request_in_progress`.
+  The key is claimed with a conditional `INSERT` before the work starts, so two
+  concurrent retries cannot both proceed — check-then-act would let them.
+- **Failed attempt** → the claim is released, so the key is free for the
+  corrected upload rather than locked for 24 hours.
+
+There are three separate anti-duplication mechanisms, at three layers, and none
+replaces another: the idempotency key guards the *request*, the deterministic
+BullMQ job id guards the *job*, and the unique checksum index guards the *content*.
 
 ---
 
@@ -407,6 +459,92 @@ a single upload is traceable end to end.
 
 ---
 
+## Production vision — AI-assisted compliance auditing
+
+**None of this section is implemented.** It is here because the MVP's shape was
+chosen with it in mind, and because the interesting question about an AI
+compliance product is not whether you can call a model — it is what you refuse
+to let the model decide.
+
+### Where AI helps, and where it must not
+
+The rules in this service are deterministic because the conditions they test
+are. "Does this certificate expire before the submission deadline?" has one
+correct answer, computable from two dates, reproducible forever. Routing that
+through a language model would make a verdict that used to be provable into one
+that is merely likely.
+
+What deterministic rules cannot do is read a requirement like:
+
+> Penyedia jasa harus memiliki pengalaman melaksanakan sekurang-kurangnya dua
+> proyek pembangunan gedung dengan nilai kontrak minimal Rp10 miliar dalam lima
+> tahun terakhir.
+
+against a forty-page experience record. That is comprehension over unstructured
+text, and it is where a model earns its place.
+
+So the split is not "AI instead of rules". It is:
+
+| Layer | Does | Must never |
+|---|---|---|
+| Extraction | Turn documents into fields, with OCR and a model where parsers fail | Decide compliance |
+| Deterministic rules | Evaluate conditions that have a provable answer | Be overridden by a model |
+| AI analysis | Interpret requirements that rules cannot express | Produce a `pass` on its own |
+| Human review | Resolve low-confidence and high-severity findings | Be bypassed when the model is confident |
+
+### What would change in the schema
+
+Very little, which is the point of having built it this way:
+
+- **`compliance_findings.evidence` already exists** and is already populated by
+  every evaluator. An AI finding would carry its source document, page and the
+  quoted span in the same column. A finding nobody can trace to a document is
+  not admissible, whether a model or a regex produced it.
+- **`finding_status.inconclusive` already exists.** A model's low-confidence
+  answer maps onto it directly, rather than needing a new "maybe" state bolted
+  on later.
+- **Rulesets are already versioned**, so a model version and prompt revision
+  would be recorded the same way a rule threshold is — a verdict stays
+  explainable after the model is upgraded.
+- **`document_extractions.extracted_data`** is where model-extracted fields
+  would land, under the same promotion rule as every other extracted field.
+
+The one genuine addition is a `review_queue`: findings routed to a human, with
+who reviewed them and what they decided. That is a table and a workflow, not a
+redesign.
+
+### Production considerations
+
+- **Model output is validated against a schema before it is persisted.** An LLM
+  that returns prose where a date was expected must fail loudly, not write a
+  null that a later rule reads as "no expiry found".
+- **A model failure must never produce a compliant verdict.** Timeouts, refusals
+  and malformed output all resolve to `inconclusive`, which routes to review.
+  The failure mode of an AI compliance tool has to be "I could not check this",
+  never "looks fine".
+- **Confidence is a routing signal, not evidence.** `0.87` means the model was
+  asked to guess how sure it is. It decides whether a human looks at the
+  finding; it does not substitute for the finding's own evidence.
+- **Tender documents are commercially sensitive.** Sending them to a third-party
+  model is a data-residency and retention decision before it is a technical one,
+  and for some buyers it will be the reason to run a model in-tenant instead.
+
+### How I would sequence it
+
+1. OCR behind the existing extractor interface — the largest accuracy win, no
+   new decision authority, and it makes the `quarantined` scans usable.
+2. Model-assisted field extraction for document types whose layout defeats the
+   parsers. Still feeding the same deterministic rules.
+3. Requirement interpretation: parse the tender announcement itself into
+   candidate rules, reviewed by a human before they become a ruleset version.
+4. AI analysis of requirements no rule expresses, writing `inconclusive`
+   findings with evidence, routed to review.
+
+Each step is useful on its own, and none of them moves a `pass` decision from
+code into a model.
+
+---
+
 ## Project structure
 
 ```
@@ -433,27 +571,43 @@ test/                    unit tests + fixtures
 ## Tests
 
 ```bash
-npm test            # 52 unit tests, no services required
+npm test            # 62 unit tests, no services required
 npm run typecheck   # tsc --noEmit, strict
 
-DATABASE_URL=postgres://... npm test   # + 15 schema-drift checks
+# + 27 integration tests against a real database and queue
+DATABASE_URL=postgres://... REDIS_URL=redis://... npm test
 ```
 
-The tests cover what would actually break in production: the validation gate
-including a disguised-file case, the Indonesian date and NPWP extraction, and
-the compliance evaluators — including the exact-threshold bid bond and a value
-past `Number.MAX_SAFE_INTEGER`, where a float comparison would pass a bond that
-is short.
+**Unit tests** cover the logic that is wrong-or-right on its own: the validation
+gate including a disguised-file case, the Indonesian date and NPWP extraction,
+the request fingerprint, and the compliance evaluators — including the
+exact-threshold bid bond and a value past `Number.MAX_SAFE_INTEGER`, where a
+float comparison would pass a bond that is short.
 
 Fixtures generate real PDF bytes rather than asserting against hand-written
 buffers, so the parser is genuinely exercised.
 
-`test/integration/schema-drift.spec.ts` selects one row through every entity
-against a migrated database. Because the entities are a hand-written mapping
-over SQL the ORM did not generate (ADR 0001), that is what turns a renamed
-column into a build failure instead of a 500 on whichever endpoint touches it
-first. It activates only when `DATABASE_URL` is set, so the unit suite stays
-runnable with nothing installed. CI runs both.
+**Integration tests** cover the claims that only hold if several components
+agree, and that a unit test with a mocked repository would happily confirm while
+production disagreed:
+
+- the request path persisting what it says it persisted — version row, slot
+  pointer, queue job and audit trail entry
+- versioning driven by content, not by the caller: identical bytes de-duplicate,
+  different bytes become version 2, and version 1 survives
+- idempotency across a repeat, a conflicting reuse, and a failed attempt
+- **tenant isolation** — organisation B gets `404`, not `403`, on A's tender,
+  document status and audits. This README claims isolation; this is where that
+  claim is checked rather than asserted.
+
+`test/integration/schema-drift.spec.ts` additionally selects one row through
+every entity against a migrated database. Because the entities are a
+hand-written mapping over SQL the ORM did not generate (ADR 0001), that is what
+turns a renamed column into a build failure instead of a 500 on whichever
+endpoint touches it first.
+
+The integration suites skip themselves when `DATABASE_URL` is unset, so the unit
+suite stays runnable with nothing installed. CI runs everything.
 
 ---
 
@@ -483,6 +637,7 @@ Stated rather than left for a reviewer to infer:
 - [ADR 0001 — SQL-first schema, ORM as a mapping layer](docs/adr/0001-sql-first-schema.md)
 - [ADR 0002 — Asynchronous ingestion behind a queue](docs/adr/0002-async-ingestion.md)
 - [ADR 0003 — Rules as data, evaluators as code](docs/adr/0003-rules-as-data.md)
+- [ADR 0004 — Hybrid storage for extracted fields](docs/adr/0004-hybrid-extraction-storage.md)
 
 ## Supabase mapping
 
