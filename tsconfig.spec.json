@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // Fixture factories build partial entities and cast them; flagging unused
+    // locals in test helpers adds noise without catching anything.
+    "noUnusedLocals": false
+  },
+  "include": ["src/**/*", "test/**/*", "scripts/**/*"]
+}
