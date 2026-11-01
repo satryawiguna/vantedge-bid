@@ -13,11 +13,35 @@ const ORG_ID = '00000000-0000-4000-8000-000000000001';
 const USER_ID = '00000000-0000-4000-8000-000000000002';
 const TENDER_ID = '00000000-0000-4000-8000-000000000003';
 
+/**
+ * Pick up a local `.env` the way Docker Compose does, so `npm run seed` reaches
+ * the same database the rest of the setup uses. Node's built-in loader never
+ * overrides a variable that is already set, so an explicit
+ * `DATABASE_URL=... npm run seed` still wins. A missing file is not an error.
+ */
+function loadLocalEnv(): void {
+  try {
+    process.loadEnvFile('.env');
+  } catch {
+    // No .env: fall back to the defaults below.
+  }
+}
+
+/**
+ * DATABASE_URL if set; otherwise the Compose database on the published host
+ * port (POSTGRES_HOST_PORT, default 5432 — override it when the port is taken
+ * by a local Postgres and Compose publishes 5433 instead).
+ */
+function databaseUrl(): string {
+  return (
+    process.env.DATABASE_URL ??
+    `postgres://vantedge:vantedge@localhost:${process.env.POSTGRES_HOST_PORT ?? 5432}/vantedge`
+  );
+}
+
 async function main(): Promise<void> {
-  const client = new Client({
-    connectionString:
-      process.env.DATABASE_URL ?? 'postgres://vantedge:vantedge@localhost:5432/vantedge',
-  });
+  loadLocalEnv();
+  const client = new Client({ connectionString: databaseUrl() });
   await client.connect();
 
   try {

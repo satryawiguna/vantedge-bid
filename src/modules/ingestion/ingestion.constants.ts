@@ -1,6 +1,38 @@
 export const INGESTION_QUEUE = 'document-ingestion';
 
 /**
+ * Compliance auditing runs on its own queue, for two reasons.
+ *
+ * **Failure isolation.** The audit used to run inside the ingestion job's
+ * try/catch, so an audit that threw marked the *document* failed — blaming a
+ * successfully extracted file for a compliance-engine problem, and retrying the
+ * extraction to fix something extraction had nothing to do with. Separate
+ * queues give the two their own retry policies and their own terminal states.
+ *
+ * **Amplification.** Auditing inline meant one full tender audit per ingested
+ * document: a 41-document upload session produced 41 audits and 2,193 finding
+ * rows. The job id is per tender and the job is published with a delay, so
+ * repeated ingestions inside that window collapse into a single audit.
+ */
+export const COMPLIANCE_AUDIT_QUEUE = 'compliance-audit';
+
+export interface ComplianceAuditJobPayload {
+  organizationId: string;
+  tenderId: string;
+}
+
+/**
+ * Audit job ids are unique per run (`audit-<tenderId>-<uuid>`, minted in
+ * ComplianceQueueService) rather than fixed per tender.
+ *
+ * A fixed id looked like free coalescing and was two bugs: a request arriving
+ * while an audit was *active* resolved to the running job and was dropped, and
+ * a retained *failed* job held the name for a week, locking the tender out of
+ * auditing entirely. Coalescing now comes from `tender_audit_state`, which is
+ * durable, rather than from id collisions in Redis, which are not.
+ */
+
+/**
  * The queue job id for one unit of ingestion work.
  *
  * Derived from the **version**, not the content hash. The unit of work is a

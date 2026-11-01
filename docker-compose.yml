@@ -8,7 +8,8 @@ services:
       POSTGRES_PASSWORD: vantedge
       POSTGRES_DB: vantedge
     ports:
-      - '5432:5432'
+      # Host port is overridable (POSTGRES_HOST_PORT=5433) when 5432 is taken.
+      - '${POSTGRES_HOST_PORT:-5432}:5432'
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -23,28 +24,12 @@ services:
     # bounce silently drops every job that had not yet been processed.
     command: ['redis-server', '--appendonly', 'yes']
     ports:
-      - '6379:6379'
+      # Host port is overridable (REDIS_HOST_PORT=6380) when 6379 is taken.
+      - '${REDIS_HOST_PORT:-6379}:6379'
     volumes:
       - redis-data:/data
     healthcheck:
       test: ['CMD', 'redis-cli', 'ping']
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
-  minio:
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
-    command: ['server', '/data', '--console-address', ':9001']
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    ports:
-      - '9000:9000'
-      - '9001:9001'
-    volumes:
-      - minio-data:/data
-    healthcheck:
-      test: ['CMD', 'mc', 'ready', 'local']
       interval: 5s
       timeout: 3s
       retries: 10
@@ -57,10 +42,6 @@ services:
     environment:
       DATABASE_URL: postgres://vantedge:vantedge@postgres:5432/vantedge
       REDIS_URL: redis://redis:6379
-      STORAGE_ENDPOINT: http://minio:9000
-      STORAGE_BUCKET: tender-documents
-      STORAGE_ACCESS_KEY_ID: minioadmin
-      STORAGE_SECRET_ACCESS_KEY: minioadmin
     depends_on:
       postgres:
         condition: service_healthy
@@ -72,25 +53,30 @@ services:
       target: runtime
     command: ['node', 'dist/main']
     environment:
-      NODE_ENV: production
+      # `production` unless overridden. Demo mode (GET /v1/demo/organizations) is
+      # refused under production, so to try it in Docker set both
+      # DEMO_MODE=true and API_NODE_ENV=demo (e.g. in .env). Off by default.
+      NODE_ENV: ${API_NODE_ENV:-production}
+      DEMO_MODE: ${DEMO_MODE:-false}
       PORT: 3000
       LOG_LEVEL: info
       DATABASE_URL: postgres://vantedge:vantedge@postgres:5432/vantedge
       REDIS_URL: redis://redis:6379
-      STORAGE_DRIVER: s3
-      STORAGE_ENDPOINT: http://minio:9000
+      # Local-disk storage on a shared volume. MinIO's public image is no longer
+      # published, so Compose does not run an S3 service; point STORAGE_DRIVER=s3
+      # at any S3-compatible endpoint to use that driver instead. The local driver
+      # is single-host: every api/worker replica must mount the same volume.
+      STORAGE_DRIVER: local
+      STORAGE_LOCAL_ROOT: /data/storage
       STORAGE_BUCKET: tender-documents
-      STORAGE_ACCESS_KEY_ID: minioadmin
-      STORAGE_SECRET_ACCESS_KEY: minioadmin
-      STORAGE_FORCE_PATH_STYLE: 'true'
     ports:
       - '3000:3000'
+    volumes:
+      - storage-data:/data/storage
     depends_on:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_healthy
-      minio:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
@@ -117,23 +103,24 @@ services:
       DATABASE_POOL_SIZE: '6'
       REDIS_URL: redis://redis:6379
       INGESTION_CONCURRENCY: '5'
-      STORAGE_DRIVER: s3
-      STORAGE_ENDPOINT: http://minio:9000
+      # Local-disk storage on a shared volume. MinIO's public image is no longer
+      # published, so Compose does not run an S3 service; point STORAGE_DRIVER=s3
+      # at any S3-compatible endpoint to use that driver instead. The local driver
+      # is single-host: every api/worker replica must mount the same volume.
+      STORAGE_DRIVER: local
+      STORAGE_LOCAL_ROOT: /data/storage
       STORAGE_BUCKET: tender-documents
-      STORAGE_ACCESS_KEY_ID: minioadmin
-      STORAGE_SECRET_ACCESS_KEY: minioadmin
-      STORAGE_FORCE_PATH_STYLE: 'true'
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-      minio:
-        condition: service_healthy
       migrate:
         condition: service_completed_successfully
+    volumes:
+      - storage-data:/data/storage
 
 volumes:
   postgres-data:
   redis-data:
-  minio-data:
+  storage-data:

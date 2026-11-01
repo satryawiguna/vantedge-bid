@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createHash } from 'node:crypto';
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve, sep } from 'node:path';
 import { AppError } from '../common/errors/app-error';
 import { ErrorCode } from '../common/errors/error-codes';
@@ -24,10 +24,33 @@ export class LocalStorageService extends StorageService {
     this.root = resolve(config.get<string>('storage.localRoot', './.storage'));
   }
 
+  /**
+   * Write through a temporary file and rename into place.
+   *
+   * `rename` within a filesystem is atomic, so a concurrent reader sees either
+   * the previous object or the complete new one, never a half-written file.
+   * Writing directly to the final path does not have that property, and two
+   * identical uploads racing each other would otherwise be able to hand a
+   * worker a truncated document.
+   *
+   * S3 PUT is already atomic, which is why only this driver needs the dance.
+   */
   async put(params: PutObjectParams): Promise<StoredObject> {
     const path = this.resolveKey(params.key);
     await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, params.body);
+
+    const temporary = `${path}.${randomUUID()}.part`;
+    try {
+      await writeFile(temporary, params.body);
+      await rename(temporary, path);
+    } catch (error) {
+      await rm(temporary, { force: true }).catch(() => undefined);
+      throw AppError.internal(
+        ErrorCode.STORAGE_UNAVAILABLE,
+        'Could not persist the uploaded file.',
+        error,
+      );
+    }
 
     return {
       bucket: this.bucket,
@@ -35,6 +58,15 @@ export class LocalStorageService extends StorageService {
       sizeBytes: params.body.byteLength,
       checksumSha256: createHash('sha256').update(params.body).digest('hex'),
     };
+  }
+
+  async head(key: string): Promise<{ sizeBytes: number } | null> {
+    try {
+      const stats = await stat(this.resolveKey(key));
+      return { sizeBytes: stats.size };
+    } catch {
+      return null;
+    }
   }
 
   async get(key: string): Promise<Buffer> {
@@ -54,12 +86,7 @@ export class LocalStorageService extends StorageService {
   }
 
   async exists(key: string): Promise<boolean> {
-    try {
-      await stat(this.resolveKey(key));
-      return true;
-    } catch {
-      return false;
-    }
+    return (await this.head(key)) !== null;
   }
 
   async createUploadUrl(): Promise<string> {

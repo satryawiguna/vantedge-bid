@@ -22,10 +22,13 @@ process consuming a Redis/BullMQ queue.
 
 Three properties make the asynchrony safe rather than merely convenient:
 
-- The queue job id is the content checksum, so enqueueing is idempotent at the
-  broker.
-- `document_versions.checksum_sha256` is unique per organisation, so duplicate
-  work is rejected by the database even if the broker is bypassed.
+- The queue job id is derived from the version id (`ingest-<versionId>`), so
+  enqueueing is idempotent at the broker. (It was originally the content
+  checksum; that stopped identifying work once the same bytes could belong to
+  two slots.)
+- `document_versions` is unique on `(document_id, checksum_sha256)` — the same
+  content in the same slot — so a duplicate in one slot is rejected by the
+  database even if the broker is bypassed.
 - An unreadable document is thrown as `UnrecoverableError` rather than retried,
   so terminal failures leave the retry loop immediately.
 
@@ -37,6 +40,17 @@ Together these turn at-least-once delivery into exactly-once *effect*.
 depth, independently of request rate. A CPU-bound parse cannot block the event
 loop that is meant to be accepting uploads. Retry and backoff policy lives in
 one place.
+
+**Amended since.** Two parts of this decision were refined once the system was
+run under load:
+
+- The post-ingestion audit was moved onto its own queue
+  ([ADR 0005](0005-audit-on-its-own-queue.md)), because running it inside the
+  ingestion job fused two unrelated failure domains.
+- Publication is recorded durably (`ingestion_jobs.published_at`) and swept by
+  `IngestionReconciler`, so a process that dies between the commit and the
+  publish no longer leaves work nobody will do. The commit-then-publish ordering
+  itself is unchanged and remains the point.
 
 **Bad.** The client must poll, so "uploaded" and "checked" are different states
 it has to model. Redis becomes a availability dependency for ingestion —

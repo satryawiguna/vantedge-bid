@@ -10,7 +10,7 @@ import {
   IngestionJob,
 } from '../../database/entities';
 import { DocumentLifecycle, IngestionJobState } from '../../database/enums';
-import { ComplianceService } from '../compliance/compliance.service';
+import { ComplianceQueueService } from '../compliance/compliance.queue';
 import { ExtractionService } from './extraction/extraction.service';
 import { INGESTION_QUEUE, IngestionJobPayload } from './ingestion.constants';
 
@@ -32,7 +32,7 @@ export class IngestionProcessor extends WorkerHost {
   constructor(
     @InjectDataSource() private readonly dataSource: DataSource,
     private readonly extraction: ExtractionService,
-    private readonly compliance: ComplianceService,
+    private readonly auditQueue: ComplianceQueueService,
     config: ConfigService,
   ) {
     super();
@@ -75,19 +75,39 @@ export class IngestionProcessor extends WorkerHost {
 
       await this.finishSuccessfully(payload, jobKey, startedAt);
 
-      // The audit runs after every ingestion so the tender's compliance state
-      // is never stale with respect to its documents.
-      await this.compliance.auditTender({
-        organizationId: payload.organizationId,
-        tenderId: payload.tenderId,
-        trigger: 'document_ingested',
-      });
-
       return { textLength: result.textLength, confidence: result.confidence };
     } catch (error) {
       await this.recordFailure(payload, jobKey, job, error, startedAt);
       throw error;
+    } finally {
+      // Outside the try/catch on purpose, and after the ingestion outcome is
+      // already committed.
+      //
+      // The audit used to run inside the try block, which tied two unrelated
+      // failures together: an audit that threw was caught by the ingestion
+      // handler, marked the *document* failed, and had BullMQ retry the
+      // extraction to fix a compliance-engine problem. Requesting an audit is
+      // now a side effect that cannot change what extraction decided, and
+      // ComplianceQueueService swallows its own scheduling errors for the same
+      // reason.
+      await this.requestAudit(payload);
     }
+  }
+
+  private async requestAudit(payload: IngestionJobPayload): Promise<void> {
+    const [version] = await this.dataSource.query<Array<{ lifecycle: string }>>(
+      'SELECT lifecycle FROM document_versions WHERE id = $1',
+      [payload.versionId],
+    );
+
+    // A document that failed or was quarantined has nothing new to contribute,
+    // and auditing on every failed attempt would undo the debouncing.
+    if (version?.lifecycle !== DocumentLifecycle.Processed) return;
+
+    await this.auditQueue.requestAudit({
+      organizationId: payload.organizationId,
+      tenderId: payload.tenderId,
+    });
   }
 
   @OnWorkerEvent('failed')

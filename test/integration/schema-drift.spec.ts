@@ -38,13 +38,20 @@ describeIfDatabase('schema drift', () => {
   );
 
   it('has applied every migration in db/migrations', async () => {
+    // Read the directory rather than hard-coding the list: a new migration
+    // should make this test start covering it, not start failing.
+    const { readdirSync } = await import('node:fs');
+    const { join } = await import('node:path');
+
+    const onDisk = readdirSync(join(__dirname, '..', '..', 'db', 'migrations'))
+      .filter((name) => name.endsWith('.sql'))
+      .sort();
+
     const rows = await dataSource.query<Array<{ filename: string }>>(
       'SELECT filename FROM schema_migrations ORDER BY filename',
     );
-    expect(rows.map((row) => row.filename)).toEqual([
-      '001_init_schema.sql',
-      '002_seed_reference_data.sql',
-    ]);
+
+    expect(rows.map((row) => row.filename)).toEqual(onDisk);
   });
 
   it('seeded a compliance rule for every evaluator the registry exposes', async () => {

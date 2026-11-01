@@ -8,6 +8,8 @@ before the bid is submitted.
 
 NestJS · TypeScript · PostgreSQL · Redis/BullMQ · S3-compatible storage · Docker Compose
 
+**Documentation:** start at the [documentation index](docs/README.md) — numbered context documents (overview, domain, architecture, data model, ingestion, compliance, security, API, testing, operations, known gaps), the [ERD](docs/ERD.md), [ADRs](docs/adr/) and historical [reviews](docs/reviews/). AI-assisted work: see [CLAUDE.md](CLAUDE.md) and [AGENTS.md](AGENTS.md).
+
 ---
 
 ## Why these two modules belong together
@@ -33,14 +35,14 @@ the design can be judged — not implemented, and not claimed to be.
 
 | | Status |
 |---|---|
-| PostgreSQL schema, ERD, migrations | **Implemented** — 14 tables, applied by `npm run migrate` |
+| PostgreSQL schema, ERD, migrations | **Implemented** — 15 tables, applied by `npm run migrate` |
 | Document ingestion REST API with size and format validation | **Implemented** — 8-stage gate, [below](#validation-gate) |
-| Queue and worker, asynchronous processing | **Implemented** — BullMQ, separate process |
-| Content de-duplication and request idempotency | **Implemented** — enforced by the database |
+| Queue and worker, asynchronous processing | **Implemented** — BullMQ, separate process, with publish reconciliation |
+| Content de-duplication and request idempotency | **Implemented** — claim, ownership and slot uniqueness are enforced by SQL; takeover recovery and explicit-slot validation are application logic in `DocumentsService`, verified by tests |
 | Rule-based compliance engine over a versioned ruleset | **Implemented** — 10 evaluators, 12 seeded rules |
 | Document field extraction | **Implemented, heuristic** — text-layer PDFs only, no OCR |
 | OpenAPI documentation | **Implemented** — generated from the code at `/docs` |
-| Tests | **Implemented** — 62 unit, 32 integration against a real database, queue and worker |
+| Tests | **Implemented** — 104 unit, 106 integration against a real database, queue and worker |
 | — | — |
 | AI-assisted document understanding | **Design only** — [Production vision](#production-vision--ai-assisted-compliance-auditing) |
 | OCR for scanned documents | **Design only** |
@@ -59,7 +61,7 @@ bounded, and the boundaries are stated rather than left to be discovered.
 
 ```bash
 cp .env.example .env
-docker compose up -d --build        # postgres, redis, minio, migrations, api, worker
+docker compose up -d --build        # postgres, redis, migrations, api, worker (local-disk storage)
 
 npm ci
 npm run seed                        # one organisation, one tender
@@ -92,13 +94,14 @@ flowchart LR
     end
 
     subgraph Infra[" "]
-        S[(Object storage<br/>MinIO / S3 / Supabase)]
+        S[(Object storage<br/>local disk / S3-compatible)]
         DB[(PostgreSQL)]
         Q{{Redis · BullMQ}}
     end
 
     subgraph Worker["Worker process — scales with queue depth"]
         X[Extraction]
+        AQ{{Redis · audit queue<br/>debounced per tender}}
         C[Compliance engine]
     end
 
@@ -112,7 +115,8 @@ flowchart LR
     Q --> X
     X --> S
     X --> DB
-    X --> C
+    X -->|"request audit"| AQ
+    AQ --> C
     C --> DB
     Client -->|"poll statusUrl"| DB
 ```
@@ -178,6 +182,43 @@ no I/O. That keeps them unit-testable without a container and keeps the query
 count independent of the rule count: twelve rules over thirty documents is four
 queries, not three hundred and sixty.
 
+**Audits triggered by ingestion are debounced.** Auditing inline, once per
+ingested document, meant a 41-document upload session produced 41 full tender
+audits and 2,193 finding rows — each one re-evaluating every rule against every
+document. Audits are now requested per tender and published with a short delay,
+so a burst collapses onto one pending audit; the survivor evaluates the tender's
+state when it runs, which is everything the dropped requests would have seen.
+Measured on the same 40-document burst: **1 audit, 33 finding rows.**
+
+**The intent lives in Postgres, not in the broker.** Leaning on one
+deterministic job id per tender is the obvious way to coalesce, and it is wrong
+in two states a busy tenant reaches routinely. An add that arrives while the job
+is *active* resolves to the running job and is dropped, so the document that
+triggered it is never audited. A retained *failed* job holds that id for a week,
+and the tender cannot be audited at all until it expires. Neither shows up in a
+single-threaded test.
+
+So `tender_audit_state` records per tender that an audit is owed (`pending`) and
+which run is scheduled to carry it (`scheduled_job_id`, unique per run).
+Requests coalesce by claiming that column with a conditional `UPDATE`, so
+exactly one of several simultaneous callers publishes — the de-duplication
+survives concurrency instead of depending on id collisions. A run takes the flag
+*before* reading any documents, which turns "a document landed mid-audit" into a
+fact rather than an inference. The run keeps `scheduled_job_id` for as long as
+it is running, so a request arriving mid-audit finds the slot occupied: it sets
+the flag and schedules nothing, which means a tender never has two ingestion-
+triggered audits running at once. When the run ends, `finishRun` releases the
+slot and reads the flag in one statement, and if a request arrived the processor
+schedules one follow-up — which therefore starts after the active audit ended
+and sees every document processed meanwhile. A run that fails *for good* (not a
+retried attempt) restores the flag and frees its slot from the worker's `failed`
+handler; the reconciler, or the next request, schedules a new run under a fresh
+job id, so a retained failed job never blocks the tender. The reconciler also
+schedules for any tender whose intent has no live job. The manual audit endpoint
+is synchronous and bypasses all of this. This holds across several worker processes with no
+shared timer and no in-memory state. The trade is explicit: an extra audit is
+wasted work, a skipped one is a wrong verdict.
+
 Findings are not binary. `inconclusive` exists because a compliance tool that
 silently passes an unreadable certificate is worse than no tool at all.
 
@@ -185,22 +226,43 @@ silently passes an unreadable certificate is worse than no tool at all.
 
 ## Data model
 
-Fourteen tables. Full ERD, relationship explanations and the reasoning behind
-each decision: **[docs/ERD.md](docs/ERD.md)**.
+Fifteen domain tables (the migrator also keeps its own `schema_migrations`
+bookkeeping table, which is not part of the model). Full ERD, relationship
+explanations and the reasoning behind each decision:
+**[docs/ERD.md](docs/ERD.md)**.
+
+The schema is built by six forward-only migrations in `db/migrations/`, applied
+in order by `npm run migrate`; the migrator checksums applied files and refuses
+a changed one.
+
+| Migration | Adds |
+|---|---|
+| `001_init_schema.sql` | the original 14 domain tables, enums, indexes |
+| `002_seed_reference_data.sql` | document types, ruleset v1 and its rules |
+| `003_ingestion_job_publication.sql` | `ingestion_jobs.published_at` and the outbox index |
+| `004_reliability_corrections.sql` | `idempotency_keys.owner_token`, `document_types.allows_multiple`, `tender_audit_state` |
+| `005_correct_schema_comments.sql` | comment corrections only, no structural change |
+| `006_idempotency_operation_link.sql` | `idempotency_keys.version_id` |
 
 The four load-bearing ideas:
 
 - **`tender_documents` (slot) is separate from `document_versions` (file).** A
   correction is a new version, never an overwrite, so nothing a past audit cited
   can change underneath it.
-- **`checksum_sha256` is unique per organisation.** De-duplication and
-  idempotency are enforced by the database, not by convention — which is what
-  makes the ingestion endpoint safely retryable.
+- **`checksum_sha256` is unique per document slot**, not per tenant. The scope
+  is the whole point: a contractor submits the same SBU to every tender they
+  bid for, so tenant-wide uniqueness made the second tender's upload look like
+  a duplicate and discarded it. Repeat uploads into *one* slot are still caught
+  by the database rather than by convention, which is what makes the ingestion
+  endpoint safely retryable, and storage de-duplication is preserved separately
+  through content-addressed object keys.
 - **Rulesets are versioned and findings snapshot their severity.** Regulation
   changes. Without this, a verdict rendered in March quietly means something
   different in September, and the product cannot defend its own history.
-- **`audit_trail` is append-only.** Mutable rows answer "what is true now"; the
-  trail answers "who changed what, when". A compliance product needs both.
+- **`audit_trail` is append-only by convention.** Mutable rows answer "what is
+  true now"; the trail answers "who changed what, when". A compliance product
+  needs both. Nothing in the database enforces it yet — see
+  [known gaps](#known-gaps-stated-rather-than-discovered).
 
 ---
 
@@ -220,6 +282,31 @@ additional machine-readable `code`.
 | `GET` | `/v1/compliance-audits/:id` | Full report, worst findings first |
 | `GET` | `/v1/document-types` | Reference data and upload limits |
 | `GET` | `/healthz` · `/readyz` · `/metrics/queue` | Probes and queue depth |
+| `GET` | `/v1/demo/organizations` | **Demo only**, off by default — [see below](#demo-organization-directory) |
+
+### Demo Organization Directory
+
+Every tenant-scoped endpoint needs an `X-Organization-Id` header, and there is no organisation management in this project. To make the API easy to try, one **read-only** endpoint lists the organisations in the database:
+
+```
+GET /v1/demo/organizations?limit=50&offset=0
+```
+
+It returns only `id`, `slug`, `name` and `createdAt` (never NPWP, NIB or anything else), newest first, with `pagination: { total, limit, offset }`. `limit` defaults to 50 (maximum 100), `offset` to 0; anything invalid is a `400`. It never creates or changes data and needs no header.
+
+**It is off by default and is not authentication.** It exists only when `DEMO_MODE=true` *and* `NODE_ENV` is `development`, `test` or `demo`. Otherwise it answers `404`, exactly like a route that does not exist, and the application **refuses to start** with `NODE_ENV=production` and `DEMO_MODE=true` (or any `DEMO_MODE` other than `true`/`false`). `X-Organization-Id` remains a simulated tenant context; production would still need real authentication and authorisation ([security notes](docs/07-security-and-tenancy.md)).
+
+Try it:
+
+```bash
+# 1. in .env (copied from .env.example):  DEMO_MODE=true   (NODE_ENV=development)
+npm run seed                    # creates the demo organisation (idempotent)
+npm run start:dev               # API on :3000
+# 2. open http://localhost:3000/docs → the "Demo" tag → GET /v1/demo/organizations → Execute
+# 3. copy an `id` into the X-Organization-Id header of the tenders / documents endpoints
+```
+
+With Docker, the API container runs as `production` by default, which keeps the endpoint unavailable. To enable it, add `DEMO_MODE=true` and `API_NODE_ENV=demo` to `.env` and run `docker compose up -d --build`. The endpoint reflects whatever is in PostgreSQL; it does not seed anything itself.
 
 ### Ingest a document
 
@@ -245,7 +332,7 @@ Location: /v1/documents/versions/8f0c.../status
   "checksum": "9f2b...",
   "documentTypeCode": "SBU",
   "sizeBytes": 1184,
-  "jobId": "ingest-9f2b...",
+  "jobId": "ingest-8f0c...",
   "statusUrl": "/v1/documents/versions/8f0c.../status",
   "deduplicated": false
 }
@@ -305,8 +392,48 @@ it safe is that the key alone is not what identifies the request:
 - **Same key, same request, still running** → `409 idempotent_request_in_progress`.
   The key is claimed with a conditional `INSERT` before the work starts, so two
   concurrent retries cannot both proceed — check-then-act would let them.
-- **Failed attempt** → the claim is released, so the key is free for the
-  corrected upload rather than locked for 24 hours.
+- **Failed attempt** → a claim whose request created nothing is released, so the
+  key is free for the corrected upload rather than locked for 24 hours. A claim
+  whose request already filed a version is *not* deleted — that would let the
+  retry file the document again — but handed back as immediately takeable with
+  the version still attached (see below).
+- **Crashed attempt** → a claim with no response is a request in flight, and a
+  process that dies mid-request leaves one behind. After a **two-minute lease**
+  (`IDEMPOTENCY_CLAIM_LEASE_MS`) the *same* request may take it over, so a crash
+  blocks a retry for minutes rather than a day. A *different* request never
+  inherits a stale key — it still gets `409`. Taking over is safe because the
+  retry does not redo the work: the claim records the version its request
+  created (`idempotency_keys.version_id`, migration 006), and the takeover
+  recovers that version instead of filing another.
+
+**Claims have an owner, not just an age.** Every acquisition mints an
+`owner_token`, and completing or releasing a claim is conditional on still
+holding it. Without that, a request whose lease lapsed while it was merely slow
+could come back and delete its successor's claim, or write its own response
+under it — handing the next caller someone else's answer. Losing the race is not
+an error for the slow request: its own work succeeded and its own response is
+returned, it simply does not get to record it.
+
+**Claims remember the operation they began.** `version_id` is written in the
+same transaction that creates the `document_versions` row, conditional on
+`owner_token`, so "the claim names a version" and "the version exists" commit
+together or not at all; a request that lost its claim fails that write and its
+transaction rolls back, creating nothing. A takeover by the same request
+fingerprint receives the `version_id` and recovers that version through the
+normal resume path (a version whose object-store write failed is reopened to
+`pending` first). The checksum plays no part: for `SKK_PERSONIL` two
+byte-identical files are two documents, so only request identity can tell a
+retry from a second submission. A takeover by a *different* fingerprint is
+refused, and a key whose response was already recorded starts clean when it
+expires. This is an application-level guarantee built from a foreign key and a
+conditional write; the database does not stop code that bypasses `DocumentsService`.
+
+The lease is a timeout, and the ownership token is what makes a wrong timeout
+safe rather than corrupting. That is why the lease was not simply lengthened:
+two minutes comfortably exceeds the work remaining after validation — an object
+write and two short transactions, bounded by the 50 MiB ceiling — and if it ever
+proves too short, the consequence is a redundant takeover rather than a
+mis-attributed response.
 
 There are three separate anti-duplication mechanisms, at three layers, and none
 replaces another: the idempotency key guards the *request*, the deterministic
@@ -325,9 +452,62 @@ tenant therefore discarded the second tender's upload while answering `202`, and
 the audit then reported the document as never uploaded. The index now lives on
 `(document_id, checksum_sha256)`.
 
+The same reasoning applies one level further in. When the caller does not name a
+slot, a repeat is identified by **tender + document type + bytes**, not by bytes
+alone: a company deed filed as `AKTA_PENDIRIAN` and then as `PENGALAMAN_KERJA`
+is two filings of one file, not one filing done twice. When the caller *does*
+name a slot with `documentId`, the slot must belong to that tender and hold that
+document type — otherwise a file would end up filed under a type the compliance
+engine will not evaluate it as.
+
+### Four identities, deliberately kept apart
+
+| Identity | Established by | Answers |
+|---|---|---|
+| HTTP request | `Idempotency-Key` + request fingerprint | "have I already handled this call?" |
+| Logical document | `tender_documents` row | "which requirement is this for?" |
+| Version | `document_versions` row | "which submission of it?" |
+| Content | `checksum_sha256` | "which bytes?" |
+
+**A checksum identifies content, not a submission**, and the two part company
+for types a tender holds more than once. `document_types.allows_multiple` marks
+those — `SKK_PERSONIL`, `SURAT_DUKUNGAN` — and for them identical bytes are two
+submissions, because two key personnel can hold byte-identical certificates and
+collapsing them would lose one person's qualification. A repeat there is
+established by an `Idempotency-Key` or an explicit `documentId`, not by the
+hash.
+
+An explicit `documentId` is validated **before** any content-based retry lookup:
+the slot must exist, belong to this tender and organisation, not be deleted, and
+hold the requested `documentTypeCode`. (`loadExplicitSlot`, called from `persist`
+and again inside the filing transaction.) Otherwise an SBU upload aimed at the
+NIB slot with the NIB's bytes would match the NIB version and be answered as a
+valid repeat. For a single-instance type the hash is sufficient: there is only one such
+document, so the same bytes can only be it arriving twice.
+
+Slot allocation is serialised with a Postgres advisory lock on
+`(tender, document type)`. A row lock cannot help, because the contended case is
+an *empty* result — two concurrent uploads both finding no slot and both
+creating one, or both taking the one pre-opened slot and filing one person's
+certificate as a revision of another's.
+
+`current_version_id` only ever moves forward. Storage completion order is not
+request order, and an unconditional update lets a slow older upload walk the
+pointer back to the superseded file — which is then what the compliance engine
+evaluates.
+
 Storage is still de-duplicated: object keys are content-addressed per tenant, so
 one certificate across twelve tenders is **one object and twelve version rows**.
 The second upload writes a row and no bytes.
+
+Reuse is decided by asking **storage**, not the database. A `document_versions`
+row is written before its bytes are, so a row can exist for an object that was
+never successfully stored — and trusting the row would skip the write and queue
+a worker against a missing file. The check compares the stored object's size
+against the upload's, because an object truncated by a failed write is present
+but unusable. The local driver writes through a temporary file and renames into
+place, so a concurrent reader sees a complete object or none; S3 PUT is already
+atomic.
 
 ---
 
@@ -387,8 +567,43 @@ on it. Publishing first lets a worker start against state that is not yet
 durable — it drove documents to `processed` and the API's later commit then
 overwrote that back to `queued`, stranding 24% of a 40-upload burst as
 "permanently queued" with a completed extraction. If the publish fails after the
-commit, the row sits in `queued` with no live job, which is visible and is
-re-published by the client's next retry.
+commit, the row sits in `queued` with no live job — visible, and recovered two
+ways.
+
+**Recovery when the publish never happens.** `ingestion_jobs.published_at`
+records publication as a durable fact, so a `queued` row with
+`published_at IS NULL` is committed intent the broker never heard of.
+`IngestionReconciler` sweeps those on an interval and republishes them. It runs
+in both the API and the worker and claims rows with `FOR UPDATE SKIP LOCKED`, so
+several instances divide the backlog instead of contending or double-publishing.
+
+**`pending` and `queued` are recovered differently**, because they are not the
+same kind of unfinished. A `queued` version has been promoted — lifecycle
+committed, slot pointing at it, ledger row present — so only the publish can be
+missing. A `pending` version has none of that, and publishing it bare hands a
+worker a version with no ledger row to update and a slot still pointing
+elsewhere; the extraction then lands on a document the tender does not
+reference. A retry on a `pending` version therefore runs the full promotion
+path, with the ledger insert as `ON CONFLICT DO NOTHING` so repeating it stays
+idempotent.
+
+Promotion is a **conditional transition**: `UPDATE document_versions SET
+lifecycle = 'queued' WHERE id = $1 AND lifecycle = 'pending'`. Two recovery
+requests can read the same pending version; the update takes the row lock, so
+the second waits and then re-evaluates against what the first committed. Only
+the request that performed the transition moves the slot pointer, writes the
+ledger row and publishes; the other returns the lifecycle that is actually
+persisted (`processed`, if a worker already finished). Without the condition a
+stale request wrote `queued` over `processed`. Terminal states — `processed`, `failed`, `quarantined` — are left
+alone; quarantine in particular is a decision not to retry.
+Republishing is a no-op when the job is in fact live, because the job id is
+deterministic. A client retry repairs the same state sooner via
+`resumeIfStalled`; the reconciler covers the common case where nobody retries,
+which is most of them — a client that got no response usually gives up rather
+than repeating itself.
+
+`ingestion_jobs` is the outbox. It already existed; `published_at` was the only
+thing it was missing. No relay framework was added.
 
 **Deterministic job ids.** The job id is `ingest-<versionId>` — derived from the
 version, because the version is the unit of work. (A content-derived id looks
@@ -599,7 +814,9 @@ src/
 ├── main.ts              API entrypoint
 └── worker.ts            worker entrypoint
 db/migrations/           the schema — source of truth (ADR 0001)
-docs/                    ERD, ADRs
+docs/                    numbered context docs (00–11), ERD, ADRs, historical reviews
+.claude/                 project subagents and scoped rules for Claude Code
+CLAUDE.md, AGENTS.md     project instructions and shared engineering guidance
 test/                    unit tests + fixtures
 ```
 
@@ -608,10 +825,10 @@ test/                    unit tests + fixtures
 ## Tests
 
 ```bash
-npm test            # 62 unit tests, no services required
+npm test            # 104 unit tests, no services required (Jest runs serially: see jest.config.js)
 npm run typecheck   # tsc --noEmit, strict
 
-# + 32 integration tests against a real database, queue and worker
+# + 106 integration tests against a real database, queue and worker (210 total)
 DATABASE_URL=postgres://... REDIS_URL=redis://... npm test
 ```
 
@@ -639,6 +856,39 @@ production disagreed:
 - **the same certificate filed against two tenders** — both slots filled, two
   version rows, one stored object.
 
+`test/integration/recovery.spec.ts` covers the windows between systems that
+cannot be made atomic: a version row whose object was deleted or truncated,
+three identical uploads racing for one object key, a job committed but never
+published, a reconciliation pass running twice, and an idempotency claim left
+behind by a process that died.
+
+The reliability-correction suites each target one defect and drive the real
+service or processor, not restated SQL:
+
+- `idempotent-takeover.spec.ts` — crash after the version is filed, expire the
+  lease, retry: one document, one version, one ledger row, the original version
+  returned; a stale owner cannot complete or release its successor's claim; a
+  different fingerprint cannot take over; a failed object-store write recovers
+  without a second document.
+- `explicit-slot.spec.ts` — an explicit `documentId` with a mismatched type and
+  matching checksum is rejected; wrong tender, wrong organisation and deleted
+  slots are refused.
+- `concurrent-promotion.spec.ts` — two concurrent recoveries of one pending
+  version with a real ingestion worker; barriers force both to read `pending`
+  and the second to promote only after the worker finished. The lifecycle is
+  sampled throughout and never regresses.
+- `audit-followup.spec.ts` — real audit worker, one audit held open: a document
+  processed meanwhile records durable intent, no parallel audit starts, the
+  follow-up runs after the first ended and includes the new document, the first
+  audit stays in history, and nothing more runs when nothing more is requested.
+  Also: a terminally failed job (checked by its real id being in BullMQ's
+  `failed` set) is retried by the reconciler and by a fresh request.
+
+`test/integration/audit-isolation.spec.ts` replaces the worker's compliance
+service with one that always throws, then checks the ingestion outcome for
+damage: the document stays `processed`, the job stays `completed` with one
+attempt, the audit failure is visible, and the tender audits cleanly afterwards.
+
 `test/integration/worker-pipeline.spec.ts` goes further and runs the API **and a
 real worker together** under concurrent load. It exists because the other
 integration suite asserts state immediately after upload and therefore has to
@@ -653,6 +903,48 @@ every entity against a migrated database. Because the entities are a
 hand-written mapping over SQL the ORM did not generate (ADR 0001), that is what
 turns a renamed column into a build failure instead of a 500 on whichever
 endpoint touches it first.
+
+### A test only counts if it fails on the broken version
+
+Every regression test here was checked by reverting the fix and confirming the
+test goes red. That is not ceremony; three of these tests did not fail on the
+broken code when first written, and one of them had already been written off as
+proof:
+
+- **The audit-coalescing test went through `requestAudit`,** whose own
+  "is anything scheduled?" pre-check won the race before the claim inside
+  `schedule()` was ever contended. Reverting that claim left the suite green.
+  The suite now races `schedule()` directly, which is also how the reconciler
+  and the processor's follow-up reach it.
+- **The claim-ownership test re-typed the service's SQL** and so only proved
+  that Postgres honours an equality predicate. Removing the ownership condition
+  from `completeClaim` and `releaseClaim` changed nothing. The test now calls
+  the service.
+- **The advisory lock could be deleted outright** with every slot-allocation
+  test still passing: most of a request is synchronous work before the
+  transaction opens, so one upload usually finishes before the next handler is
+  scheduled. Racing two transactions was no better — whether the overlap lands
+  on the critical instant varies between runs, and a test that passes against
+  broken code most of the time is worse than no test. The suite instead asks a
+  second connection, with `pg_try_advisory_xact_lock`, whether the lock on that
+  `(tender, document type)` is held during allocation and free after commit.
+  That answer is exact.
+
+This pass's regression tests were each run against a deliberate mutation and
+failed: ignoring `version_id` on takeover (2 fail), removing the explicit-slot
+check (1 fails), dropping the `lifecycle = 'pending'` condition (2 fail),
+removing the processor's follow-up (2 fail), and freeing the job slot at run
+start as the old `claimPending` did (1 fails). One earlier assertion could not
+fail at all: `audit-isolation.spec.ts` looked a job up by `tenderId`, but job ids
+are `audit-<tenderId>-<uuid>`, so the lookup returned `null` and the test
+accepted `['failed', null]`. It now finds the real job in the failed set.
+
+Two mechanical notes, because they cost time here. A mutation has to be *valid*
+SQL: dropping `AND owner_token = $3` while still passing the parameter produces
+a bind-count error, and six tests then fail for a reason that has nothing to do
+with ownership — which reads exactly like a test catching the bug. And
+mutation runs need `--no-cache`; a cached transform made one mutation look
+survivable twice before.
 
 The integration suites skip themselves when `DATABASE_URL` is unset, so the unit
 suite stays runnable with nothing installed. CI runs everything.
@@ -672,10 +964,12 @@ Stated rather than left for a reviewer to infer:
   yields no text, is quarantined, and surfaces as a `DOC.READABLE` finding —
   visible rather than silently passed. Production would put pdfjs or Tika behind
   the same function signature.
-- **The audit runs synchronously.** It is a pure in-memory evaluation over an
-  already-loaded snapshot; no file is read. If the ruleset grows to where that
-  stops being true, it moves onto its own queue — the trigger column already
-  distinguishes the cases.
+- **Auditing is a separate failure domain.** Audits triggered by ingestion run
+  on their own queue, so an audit that throws fails its own job and is recorded
+  as a failed `compliance_audits` row — it cannot mark the document failed or
+  make BullMQ retry the extraction. The manual audit endpoint is still
+  synchronous, because it is a pure in-memory evaluation over an already-loaded
+  snapshot and the caller is waiting for the answer.
 - **OOXML files are detected as ZIP containers.** `.xlsx` and `.docx` are
   indistinguishable by magic bytes; telling them apart means reading
   `[Content_Types].xml`, which belongs in the worker, not the request path.
@@ -719,6 +1013,7 @@ same as a system that does it.
 - [ADR 0002 — Asynchronous ingestion behind a queue](docs/adr/0002-async-ingestion.md)
 - [ADR 0003 — Rules as data, evaluators as code](docs/adr/0003-rules-as-data.md)
 - [ADR 0004 — Hybrid storage for extracted fields](docs/adr/0004-hybrid-extraction-storage.md)
+- [ADR 0005 — Compliance audits on their own queue](docs/adr/0005-audit-on-its-own-queue.md)
 
 ## Supabase mapping
 

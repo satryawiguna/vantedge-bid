@@ -12,6 +12,7 @@ import { DocumentsModule } from './modules/documents/documents.module';
 import { TendersModule } from './modules/tenders/tenders.module';
 import { ComplianceModule } from './modules/compliance/compliance.module';
 import { HealthModule } from './modules/health/health.module';
+import { DemoModule } from './modules/demo/demo.module';
 
 @Module({
   imports: [
@@ -44,6 +45,7 @@ import { HealthModule } from './modules/health/health.module';
     DocumentsModule,
     ComplianceModule,
     HealthModule,
+    DemoModule,
   ],
   providers: [{ provide: APP_FILTER, useClass: AllExceptionsFilter }],
 })

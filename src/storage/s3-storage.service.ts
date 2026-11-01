@@ -112,11 +112,23 @@ export class S3StorageService extends StorageService implements OnModuleInit {
   }
 
   async exists(key: string): Promise<boolean> {
+    return (await this.head(key)) !== null;
+  }
+
+  /**
+   * A single PUT is atomic in S3 and S3-compatible stores: a reader sees the
+   * previous object or the complete new one. So unlike the local driver, this
+   * one needs no temporary-and-rename — but it still needs `head`, because a
+   * database row is not evidence that the object was ever written.
+   */
+  async head(key: string): Promise<{ sizeBytes: number } | null> {
     try {
-      await this.client.send(new HeadObjectCommand({ Bucket: this.bucket, Key: key }));
-      return true;
+      const result = await this.client.send(
+        new HeadObjectCommand({ Bucket: this.bucket, Key: key }),
+      );
+      return { sizeBytes: result.ContentLength ?? 0 };
     } catch {
-      return false;
+      return null;
     }
   }
 

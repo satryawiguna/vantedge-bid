@@ -222,6 +222,82 @@ describeIfDatabase('document ingestion (integration)', () => {
       expect(keys).toHaveLength(1);
     });
 
+    it('files one file against two different document types as two documents', async () => {
+      // A company deed can legitimately be filed as the deed *and* as evidence
+      // of experience. Matching on checksum alone treated the second filing as
+      // a repeat of the first and left its slot empty — the same class of bug
+      // as the cross-tender case, one level further in.
+      const pdf = sbuPdf(`TWOTYPES-${runId}`);
+
+      const asDeed = await attach(post(tenderA, orgA), pdf)
+        .field('documentTypeCode', 'AKTA_PENDIRIAN')
+        .expect(202);
+
+      const asExperience = await attach(post(tenderA, orgA), pdf)
+        .field('documentTypeCode', 'PENGALAMAN_KERJA')
+        .expect(202);
+
+      expect(asExperience.body.deduplicated).toBe(false);
+      expect(asExperience.body.documentId).not.toBe(asDeed.body.documentId);
+      expect(asExperience.body.documentTypeCode).toBe('PENGALAMAN_KERJA');
+
+      const [slot] = await dataSource.query(
+        'SELECT document_type_code, current_version_id FROM tender_documents WHERE id = $1',
+        [asExperience.body.documentId],
+      );
+      expect(slot.document_type_code).toBe('PENGALAMAN_KERJA');
+      expect(slot.current_version_id).toBe(asExperience.body.versionId);
+    });
+
+    it('keeps multiple certificates of the same type as separate documents', async () => {
+      // One SKK per key person: several slots of one type on one tender, which
+      // must not collapse into a single logical document.
+      const first = await attach(post(tenderA, orgA), sbuPdf(`SKK-A-${runId}`))
+        .field('documentTypeCode', 'SKK_PERSONIL')
+        .expect(202);
+
+      const second = await attach(post(tenderA, orgA), sbuPdf(`SKK-B-${runId}`))
+        .field('documentTypeCode', 'SKK_PERSONIL')
+        .expect(202);
+
+      expect(second.body.documentId).not.toBe(first.body.documentId);
+
+      const slots = await dataSource.query(
+        `SELECT id FROM tender_documents
+          WHERE tender_id = $1 AND document_type_code = 'SKK_PERSONIL' AND deleted_at IS NULL`,
+        [tenderA],
+      );
+      expect(slots.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it('refuses a file posted into a slot of another document type', async () => {
+      const slotted = await attach(post(tenderA, orgA), sbuPdf(`WRONGTYPE-${runId}`))
+        .field('documentTypeCode', 'JADWAL_PELAKSANAAN')
+        .expect(202);
+
+      const response = await attach(post(tenderA, orgA), sbuPdf(`WRONGTYPE2-${runId}`))
+        .field('documentTypeCode', 'METODE_PELAKSANAAN')
+        .field('documentId', slotted.body.documentId)
+        .expect(400);
+
+      expect(response.body.code).toBe('validation_failed');
+      expect(response.body.detail).toContain('JADWAL_PELAKSANAAN');
+    });
+
+    it("refuses an explicit slot belonging to another tenant's tender", async () => {
+      const theirs = await attach(post(tenderB, orgB), sbuPdf(`XTENANT-${runId}`))
+        .field('documentTypeCode', 'SBU')
+        .expect(202);
+
+      // Organisation A naming organisation B's slot: missing, not forbidden.
+      const response = await attach(post(tenderA, orgA), sbuPdf(`XTENANT2-${runId}`))
+        .field('documentTypeCode', 'SBU')
+        .field('documentId', theirs.body.documentId)
+        .expect(404);
+
+      expect(response.body.code).toBe('document_not_found');
+    });
+
     it('still treats a repeat into the same slot as a retry', async () => {
       const pdf = sbuPdf(`SAMESLOT-${runId}`);
 

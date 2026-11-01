@@ -6,6 +6,7 @@ import { DocumentExtraction } from '../../database/entities';
 import { ComplianceModule } from '../compliance/compliance.module';
 import { INGESTION_QUEUE } from './ingestion.constants';
 import { IngestionQueueService } from './ingestion.queue';
+import { IngestionReconciler } from './ingestion.reconciler';
 import { ExtractionService } from './extraction/extraction.service';
 
 /**
@@ -15,6 +16,11 @@ import { ExtractionService } from './extraction/extraction.service';
  * able to enqueue without becoming a consumer — importing this module into the
  * API would otherwise silently turn every API pod into a worker and undo the
  * separation the queue exists to provide. WorkerModule adds the processor.
+ *
+ * The reconciler IS registered here, so it runs in both. The API is the process
+ * that creates unpublished rows, and it keeps running while workers restart, so
+ * it is well placed to repair them; `SELECT … FOR UPDATE SKIP LOCKED` is what
+ * makes several instances doing this at once safe.
  */
 @Module({
   imports: [
@@ -33,7 +39,7 @@ import { ExtractionService } from './extraction/extraction.service';
     TypeOrmModule.forFeature([DocumentExtraction]),
     ComplianceModule,
   ],
-  providers: [IngestionQueueService, ExtractionService],
-  exports: [IngestionQueueService, ExtractionService, BullModule],
+  providers: [IngestionQueueService, ExtractionService, IngestionReconciler],
+  exports: [IngestionQueueService, ExtractionService, IngestionReconciler, BullModule],
 })
 export class IngestionModule {}

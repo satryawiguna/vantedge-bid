@@ -41,3 +41,18 @@ export class IngestDocumentDto {
   @IsBoolean()
   isMandatory?: boolean;
 }
+
+/**
+ * Documentation-only shape of the multipart request, so Swagger UI shows a file
+ * picker. The upload itself is read by `FileInterceptor('file')` into
+ * `req.file`, not into the validated body, so this class is never used for
+ * validation — `IngestDocumentDto` still is.
+ */
+export class IngestDocumentFormDto extends IngestDocumentDto {
+  @ApiProperty({
+    type: 'string',
+    format: 'binary',
+    description: 'The document file (PDF, or another type allowed for the document type).',
+  })
+  file!: unknown;
+}

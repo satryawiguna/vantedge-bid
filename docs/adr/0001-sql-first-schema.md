@@ -5,7 +5,9 @@
 ## Context
 
 The service is a compliance product. Its correctness guarantees — a bid bond
-amount that cannot be negative, a checksum that cannot repeat within a tenant,
+amount that cannot be negative, a checksum that cannot repeat within a document slot (originally scoped to the
+tenant, which discarded legitimate uploads to a second tender; see
+[ERD](../ERD.md)),
 exactly one active ruleset version — are only real if the database enforces
 them. Application-level validation is bypassed by a background worker, a
 migration script, or a future second service written in another language.

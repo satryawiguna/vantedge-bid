@@ -41,6 +41,8 @@ describeIfServices('ingestion pipeline with a live worker', () => {
     process.env.STORAGE_DRIVER = 'local';
     process.env.STORAGE_LOCAL_ROOT = `/tmp/vantedge-worker-test-${runId}`;
     process.env.INGESTION_CONCURRENCY = '5';
+    process.env.INGESTION_RECONCILE_INTERVAL_MS = '0';
+    process.env.AUDIT_DEBOUNCE_MS = '500';
 
     // Lazy: ConfigModule validates env at module definition time.
     const { AppModule } = await import('../../src/app.module');
@@ -165,6 +167,40 @@ describeIfServices('ingestion pipeline with a live worker', () => {
     );
     expect(jobs).toBe(versions);
   });
+
+  it('collapses a burst of ingestions into a small number of audits', async () => {
+    // Auditing inline meant one full tender audit per ingested document: a
+    // 41-document session produced 41 audits and 2,193 finding rows, each one
+    // re-evaluating every rule against every document. The audit job is keyed
+    // per tender and published with a delay, so a burst debounces onto one
+    // pending audit — the survivor evaluates the tender's state when it runs,
+    // which is everything the dropped requests would have seen.
+    const deadline = Date.now() + 30_000;
+    for (;;) {
+      const [{ count }] = await dataSource.query(
+        "SELECT count(*)::int FROM compliance_audits WHERE tender_id = $1 AND trigger = 'document_ingested'",
+        [tenderId],
+      );
+      if (count > 0) break;
+      if (Date.now() > deadline) throw new Error('No debounced audit ever ran');
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+
+    // Let any follow-up pass settle before counting.
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+
+    const [{ audits }] = await dataSource.query(
+      `SELECT count(*)::int AS audits FROM compliance_audits
+        WHERE tender_id = $1 AND trigger = 'document_ingested'`,
+      [tenderId],
+    );
+
+    // Generous on purpose: the point is the order of magnitude, not an exact
+    // number, and a timing-sensitive exact assertion would be flaky.
+    expect(audits).toBeGreaterThan(0);
+    expect(audits).toBeLessThanOrEqual(4);
+    expect(audits).toBeLessThan(UPLOADS / 2);
+  }, 60_000);
 
   it('leaves the tender auditable once ingestion settles', async () => {
     const audit = await request(app.getHttpServer())

@@ -34,6 +34,20 @@ export abstract class StorageService {
   abstract exists(key: string): Promise<boolean>;
 
   /**
+   * Metadata for a stored object, or null when it is not there.
+   *
+   * Exists because "is this content already stored?" cannot be answered from a
+   * database row. A `document_versions` row is written before the bytes are,
+   * so a row can legitimately exist while its object does not — and a second
+   * upload of the same content that trusted the row would skip the write and
+   * queue a worker against a file that was never written.
+   *
+   * The size is returned so the caller can tell a complete object from a
+   * truncated one, which a bare existence check cannot.
+   */
+  abstract head(key: string): Promise<{ sizeBytes: number } | null>;
+
+  /**
    * A time-limited URL the client can upload to directly.
    *
    * Unused by the multipart endpoint, present because it is the production path

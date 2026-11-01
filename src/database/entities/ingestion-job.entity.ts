@@ -22,7 +22,15 @@ export class IngestionJob {
   @Column({ name: 'queue_name', type: 'text' })
   queueName!: string;
 
-  /** Deterministic, derived from the content checksum — makes enqueue idempotent. */
+  /**
+   * Deterministic, derived from the **version** id — `ingest-<versionId>`.
+   *
+   * It was originally derived from the content checksum, which stopped being
+   * unique once the same bytes could legitimately belong to two slots: the
+   * second version's publish collided with the first job's id and was rejected.
+   * One job per version is the identity the pipeline actually needs, and it
+   * still makes enqueue idempotent under retry.
+   */
   @Column({ name: 'job_key', type: 'text' })
   jobKey!: string;
 
@@ -45,6 +53,16 @@ export class IngestionJob {
 
   @CreateDateColumn({ name: 'enqueued_at', type: 'timestamptz' })
   enqueuedAt!: Date;
+
+  /**
+   * When the broker accepted this job.
+   *
+   * NULL on a `queued` row means the database recorded the intent but the
+   * publish never completed — the process died in the window between commit and
+   * publish. `IngestionReconciler` republishes exactly those.
+   */
+  @Column({ name: 'published_at', type: 'timestamptz', nullable: true })
+  publishedAt!: Date | null;
 
   @Column({ name: 'started_at', type: 'timestamptz', nullable: true })
   startedAt!: Date | null;

@@ -16,6 +16,7 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { memoryStorage } from 'multer';
 import { Response } from 'express';
 import {
+  ApiBody,
   ApiConsumes,
   ApiHeader,
   ApiOperation,
@@ -26,7 +27,7 @@ import { OrgContext, OrganizationContext } from '../../common/decorators/organiz
 import { OrganizationContextGuard } from '../../common/guards/organization-context.guard';
 import { ValidatedBody } from '../../common/decorators/validated-body.decorator';
 import { DocumentsService } from './documents.service';
-import { IngestDocumentDto } from './dto/ingest-document.dto';
+import { IngestDocumentDto, IngestDocumentFormDto } from './dto/ingest-document.dto';
 import { IngestDocumentResponseDto } from './dto/ingest-document-response.dto';
 
 /**
@@ -46,6 +47,7 @@ export class DocumentsController {
   @Post('tenders/:tenderId/documents')
   @HttpCode(HttpStatus.ACCEPTED)
   @ApiConsumes('multipart/form-data')
+  @ApiBody({ type: IngestDocumentFormDto })
   @ApiOperation({
     summary: 'Ingest a tender document',
     description:
@@ -55,7 +57,11 @@ export class DocumentsController {
   })
   @ApiHeader({ name: 'Idempotency-Key', required: false })
   @ApiResponse({ status: 202, type: IngestDocumentResponseDto })
-  @ApiResponse({ status: 409, description: 'Identical content already stored for this tenant.' })
+  @ApiResponse({
+    status: 409,
+    description:
+      'The Idempotency-Key was already used for a different request, or an identical request with that key is still being processed.',
+  })
   @ApiResponse({ status: 413, description: 'File exceeds the limit for this document type.' })
   @ApiResponse({ status: 415, description: 'Rejected by the format or signature check.' })
   @ApiResponse({ status: 422, description: 'The tender submission deadline has passed.' })

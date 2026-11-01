@@ -28,6 +28,12 @@ COPY package.json ./
 # The migrator reads the .sql files at runtime; they are not compiled in.
 COPY db ./db
 
+# Local-disk object storage lives here (the api and worker mount one volume at
+# this path). It is created and owned by `node` in the image so that a named
+# volume inherits that ownership on first mount; otherwise the non-root user
+# cannot write to it.
+RUN mkdir -p /data/storage && chown node:node /data/storage
+
 USER node
 EXPOSE 3000
 ENTRYPOINT ["/sbin/tini", "--"]

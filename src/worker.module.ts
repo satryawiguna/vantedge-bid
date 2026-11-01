@@ -8,6 +8,7 @@ import { StorageModule } from './storage/storage.module';
 import { IngestionModule } from './modules/ingestion/ingestion.module';
 import { IngestionProcessor } from './modules/ingestion/ingestion.processor';
 import { ComplianceModule } from './modules/compliance/compliance.module';
+import { ComplianceAuditProcessor } from './modules/compliance/compliance.processor';
 
 /**
  * The worker process.
@@ -37,11 +38,11 @@ import { ComplianceModule } from './modules/compliance/compliance.module';
     DatabaseModule,
     StorageModule,
     IngestionModule,
-    // IngestionProcessor is declared here rather than in IngestionModule — the
-    // API imports that module to enqueue and must not become a consumer — so
-    // its collaborators have to be resolvable from this module's graph.
+    // The processors are declared here rather than in their own modules — the
+    // API imports those to publish and must not become a consumer — so their
+    // collaborators have to be resolvable from this module's graph.
     ComplianceModule,
   ],
-  providers: [IngestionProcessor],
+  providers: [IngestionProcessor, ComplianceAuditProcessor],
 })
 export class WorkerModule {}

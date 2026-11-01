@@ -5,6 +5,8 @@
  * first request is harder to operate than one that refuses to start. This runs
  * before the Nest container is built.
  */
+import { resolveDemoMode } from './demo-mode';
+
 const REQUIRED_ALWAYS = ['DATABASE_URL', 'REDIS_URL'] as const;
 
 const REQUIRED_FOR_S3 = [
@@ -26,6 +28,10 @@ export function validateEnv(env: Record<string, unknown>): Record<string, unknow
       if (!env[key]) missing.push(key);
     }
   }
+
+  // Throws on an invalid DEMO_MODE or on DEMO_MODE=true outside an explicitly
+  // non-production NODE_ENV, so a misconfigured deployment refuses to start.
+  resolveDemoMode(env);
 
   if (missing.length > 0) {
     throw new Error(

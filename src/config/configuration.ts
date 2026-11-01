@@ -1,4 +1,5 @@
 import { registerAs } from '@nestjs/config';
+import { isDemoModeEnabled } from './demo-mode';
 
 const int = (value: string | undefined, fallback: number): number => {
   if (value === undefined || value.trim() === '') return fallback;
@@ -17,6 +18,13 @@ export const appConfig = registerAs('app', () => ({
   port: int(process.env.PORT, 3000),
   logLevel: process.env.LOG_LEVEL ?? 'info',
   uploadMaxBytes: int(process.env.UPLOAD_MAX_BYTES, 52_428_800),
+  /** Lease on a claimed idempotency key; see DocumentsService.claimLeaseMs. */
+  idempotencyClaimLeaseMs: int(process.env.IDEMPOTENCY_CLAIM_LEASE_MS, 120_000),
+  /**
+   * True only when DEMO_MODE=true in an explicitly non-production environment
+   * (see config/demo-mode.ts). Defaults to false and fails closed.
+   */
+  demoEnabled: isDemoModeEnabled(process.env),
 }));
 
 export const databaseConfig = registerAs('database', () => ({
@@ -29,6 +37,13 @@ export const queueConfig = registerAs('queue', () => ({
   ingestionQueueName: process.env.INGESTION_QUEUE_NAME ?? 'document-ingestion',
   concurrency: int(process.env.INGESTION_CONCURRENCY, 5),
   maxAttempts: int(process.env.INGESTION_MAX_ATTEMPTS, 5),
+  /** How long a committed-but-unpublished job is left before republishing. */
+  reconcileGraceMs: int(process.env.INGESTION_RECONCILE_GRACE_MS, 30_000),
+  /** 0 disables the reconciler, which is what the test suite does. */
+  reconcileIntervalMs: int(process.env.INGESTION_RECONCILE_INTERVAL_MS, 30_000),
+  /** Window in which repeated ingestions collapse into one tender audit. */
+  auditDebounceMs: int(process.env.AUDIT_DEBOUNCE_MS, 3_000),
+  auditMaxAttempts: int(process.env.AUDIT_MAX_ATTEMPTS, 3),
 }));
 
 export const storageConfig = registerAs('storage', () => ({

@@ -25,6 +25,17 @@ export class DocumentType {
   @Column({ name: 'is_mandatory_default', type: 'boolean', default: true })
   isMandatoryDefault!: boolean;
 
+  /**
+   * May a tender hold several independent documents of this type?
+   *
+   * True for SKK (one per key person) and supplier support letters. Those are
+   * distinct logical documents that happen to share a type, and two of them can
+   * hold byte-identical files — so for these the content hash says nothing
+   * about whether two uploads are the same submission.
+   */
+  @Column({ name: 'allows_multiple', type: 'boolean', default: false })
+  allowsMultiple!: boolean;
+
   @Column({ name: 'allowed_mime_types', type: 'text', array: true })
   allowedMimeTypes!: string[];
 
