@@ -5,7 +5,7 @@
 
 ## Conventions
 - URI versioning: business endpoints are under `/v1`; probes are version-neutral.
-- Every `/v1` endpoint requires `X-Organization-Id: <uuid>` (optional `X-User-Id`). No other authentication.
+- Every tenant-scoped `/v1` endpoint (tenders, documents, compliance) requires `X-Organization-Id: <uuid>` (optional `X-User-Id`), enforced by `OrganizationContextGuard`. Two `/v1` routes do not: `GET /v1/document-types` (global reference data, no guard) and `GET /v1/demo/organizations` (guarded by `DemoModeGuard` instead). No other authentication.
 - Errors are RFC 7807 problem details (`application/problem+json`) with a machine-readable `code` from `error-codes.ts`.
 
 ## Endpoints
@@ -16,10 +16,10 @@
 | GET | `/v1/tenders/:tenderId` | 200 | Tender with its document slots |
 | POST | `/v1/tenders/:tenderId/documents` | **202** | Multipart ingest; see below |
 | GET | `/v1/documents/versions/:versionId/status` | 200 | Lifecycle, failure reason, extraction |
-| GET | `/v1/document-types` | 200 | Reference data and limits |
+| GET | `/v1/document-types` | 200 | Reference data and limits (no `X-Organization-Id` needed) |
 | POST | `/v1/tenders/:tenderId/compliance-audits` | 201 | **Synchronous** audit |
 | GET | `/v1/tenders/:tenderId/compliance-audits` | 200 | History (capped) |
-| GET | `/v1/compliance-audits/:auditId` | 200 | Report with findings, worst first |
+| GET | `/v1/compliance-audits/:auditId` | 200 | Report with findings, worst first. `totals.rules` is the number of findings (`compliance_audits.total_rules = findings.length`), not the number of rules |
 | GET | `/healthz`, `/readyz`, `/metrics/queue` | 200 | Liveness; database+queue readiness; ingestion queue depth |
 | GET | `/v1/demo/organizations` | 200 | **Demo only, disabled by default** (404 unless `DEMO_MODE=true` in a non-production environment); see below |
 

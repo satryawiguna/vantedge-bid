@@ -221,7 +221,7 @@ around keys that describe the parser instead of the paper.
 pending ──► queued ──► processing ──► processed
                            │
                            ├──► failed        (retries exhausted)
-                           └──► quarantined   (encrypted, corrupt, infected)
+                           └──► quarantined   (no extractable text; no malware scanning exists)
 ```
 
 `pending` exists because the row is created before the bytes are committed to

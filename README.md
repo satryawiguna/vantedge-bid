@@ -340,10 +340,12 @@ Location: /v1/documents/versions/8f0c.../status
 
 ### A failing audit
 
+Illustrative and abbreviated (two of the findings shown). `totals.rules` counts findings, not rules; the score is `(passed + 0.5 × warnings) / (passed + failed + warnings) × 100`. A response captured from a live run is in the walkthrough deck (`docs/presentation/`).
+
 ```json
 {
   "verdict": "non_compliant",
-  "score": "72.73",
+  "score": "70.83",
   "totals": { "rules": 14, "passed": 8, "failed": 3, "warnings": 1 },
   "findings": [
     {

@@ -36,7 +36,7 @@ The order matters: state is **committed to PostgreSQL before** the job is publis
 - **Commit succeeds, publish fails** → `ingestion_jobs.published_at IS NULL`; the reconciler (or a client retry) republishes.
 - **Extraction fails** → retried with exponential backoff up to `INGESTION_MAX_ATTEMPTS`; unreadable documents are quarantined (not retried).
 - **Audit fails** → fails its **own** job and is recorded as a failed audit; it never marks the document failed ([ADR 0005](adr/0005-audit-on-its-own-queue.md)).
-- **Redis loses jobs** → intent survives in `ingestion_jobs` and `tender_audit_state`; reconcilers reschedule.
+- **Redis loses jobs** → intent survives in `ingestion_jobs` and `tender_audit_state`. Audits: `reconcileAudits` reschedules any `pending` row with no live job. Ingestion: `reconcile` only republishes rows with `published_at IS NULL`, so a job that was published and *then* lost is not recovered automatically; a client retry of the same upload republishes it (`republishIfUnpublished`). See [11](11-known-gaps-and-roadmap.md).
 
 ## Scaling
 Add worker processes for queue depth and API processes for request rate; both are stateless. The next ceiling is the database (connection pool, `pg_advisory_xact_lock` per `(tender, type)` for slot allocation) — discussed in the root README. Not load-tested here.
